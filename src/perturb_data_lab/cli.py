@@ -10,6 +10,7 @@ draft-schema     Auto-draft canonicalization schemas from corpus-local inspectio
 canonicalize     Canonicalize using corpus-local final schemas.
 recalc-hvg       Recalculate per-dataset hvg.parquet files for a corpus.
 corpus-validate  Validate a corpus for logical completeness.
+corpus-compose   Compose a new federated corpus from whole dataset directories.
 corpus-gc        Garbage-collect orphaned Lance fragments not in the corpus ledger.
 """
 
@@ -21,6 +22,8 @@ import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+import yaml
 
 from .inspectors.models import InspectionBatchConfig
 from .inspectors.workflow import run_batch
@@ -773,6 +776,132 @@ def _cmd_corpus_validate(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# corpus-compose
+# ---------------------------------------------------------------------------
+
+
+def _add_corpus_compose_args(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "--input-corpus",
+        action="append",
+        required=True,
+        help="Input federated corpus root. Repeat to merge multiple corpora.",
+    )
+    sub.add_argument(
+        "--output-corpus",
+        required=True,
+        help="Output corpus root to create.",
+    )
+    sub.add_argument(
+        "--dataset-id",
+        action="append",
+        default=None,
+        help="Dataset id to include. Repeat as needed. If omitted, include all datasets.",
+    )
+    sub.add_argument(
+        "--link-mode",
+        choices=("symlink", "copy"),
+        default="symlink",
+        help="How to place dataset directories in the output corpus. Default: symlink.",
+    )
+    sub.add_argument(
+        "--corpus-id",
+        default=None,
+        help="Optional corpus_id for the output corpus. Defaults to output directory name.",
+    )
+
+
+def _cmd_corpus_compose(args: argparse.Namespace) -> None:
+    from .contracts import CONTRACT_VERSION
+    from .materializers.models import CorpusIndexDocument, DatasetJoinRecord
+
+    output_root = Path(args.output_corpus).resolve()
+    if (output_root / "corpus-index.yaml").exists():
+        raise FileExistsError(f"output corpus already exists: {output_root}")
+
+    requested_ids = set(args.dataset_id or [])
+    selected = []
+    seen_ids: set[str] = set()
+    backend: str | None = None
+    global_metadata: dict | None = None
+
+    for input_corpus in args.input_corpus:
+        input_root = Path(input_corpus).resolve()
+        corpus = _load_corpus_index(input_root)
+        input_backend = str(corpus.global_metadata["backend"])
+        input_topology = str(corpus.global_metadata["topology"])
+        if input_topology != "federated":
+            raise ValueError(f"corpus-compose only supports federated corpora: {input_root}")
+        if backend is None:
+            backend = input_backend
+            global_metadata = dict(corpus.global_metadata)
+        elif input_backend != backend:
+            raise ValueError(f"backend mismatch: expected {backend}, got {input_backend} at {input_root}")
+
+        for dataset in corpus.datasets:
+            if requested_ids and dataset.dataset_id not in requested_ids:
+                continue
+            if dataset.dataset_id in seen_ids:
+                raise ValueError(f"duplicate dataset_id selected: {dataset.dataset_id}")
+            selected.append((input_root, dataset))
+            seen_ids.add(dataset.dataset_id)
+
+    missing_ids = requested_ids - seen_ids
+    if missing_ids:
+        raise ValueError(f"requested dataset_id not found: {', '.join(sorted(missing_ids))}")
+    if not selected:
+        raise ValueError("no datasets selected")
+
+    output_root.mkdir(parents=True, exist_ok=True)
+    global_start = 0
+    output_records: list[DatasetJoinRecord] = []
+    for dataset_index, (input_root, dataset) in enumerate(selected):
+        source_dir = input_root / dataset.dataset_id
+        target_dir = output_root / dataset.dataset_id
+        if args.link_mode == "copy":
+            shutil.copytree(source_dir, target_dir)
+        else:
+            if not source_dir.exists():
+                raise FileNotFoundError(f"dataset directory not found: {source_dir}")
+            target_dir.symlink_to(source_dir, target_is_directory=True)
+
+        global_end = global_start + dataset.cell_count
+        output_records.append(
+            DatasetJoinRecord(
+                dataset_id=dataset.dataset_id,
+                dataset_index=dataset_index,
+                join_mode="create_new" if dataset_index == 0 else "append_routed",
+                manifest_path=str(Path(dataset.dataset_id) / "meta" / "materialization-manifest.yaml"),
+                cell_count=dataset.cell_count,
+                global_start=global_start,
+                global_end=global_end,
+            )
+        )
+        global_start = global_end
+
+    assert backend is not None
+    assert global_metadata is not None
+    global_metadata["backend"] = backend
+    global_metadata["topology"] = "federated"
+    (output_root / "global-metadata.yaml").write_text(
+        yaml.safe_dump(global_metadata, sort_keys=False),
+        encoding="utf-8",
+    )
+    CorpusIndexDocument(
+        kind="corpus-index",
+        contract_version=CONTRACT_VERSION,
+        corpus_id=args.corpus_id or output_root.name,
+        global_metadata=global_metadata,
+        datasets=tuple(output_records),
+    ).write_yaml(output_root / "corpus-index.yaml")
+
+    print(
+        f"[corpus-compose] wrote {len(output_records)} dataset(s) to {output_root} "
+        f"with backend={backend} link_mode={args.link_mode}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # corpus-gc (new)
 # ---------------------------------------------------------------------------
 
@@ -1324,6 +1453,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_corpus_validate_args(p_cv)
 
+    # corpus-compose
+    p_compose = sub.add_parser(
+        "corpus-compose", help="Compose a new federated corpus from selected datasets."
+    )
+    _add_corpus_compose_args(p_compose)
+
     # corpus-gc (new)
     p_gc = sub.add_parser(
         "corpus-gc", help="Garbage-collect orphaned dataset directories from a corpus."
@@ -1349,6 +1484,8 @@ def main() -> None:
         _cmd_recalc_hvg(args)
     elif args.command == "corpus-validate":
         _cmd_corpus_validate(args)
+    elif args.command == "corpus-compose":
+        _cmd_corpus_compose(args)
     elif args.command == "corpus-gc":
         _cmd_corpus_gc(args)
     else:

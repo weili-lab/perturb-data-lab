@@ -32,7 +32,10 @@ class FeatureRegistry:
     ) -> "FeatureRegistry":
         order = list(dataset_order) if dataset_order is not None else list(named_var_paths.keys())
         named_var_dfs = {
-            dataset_id: pl.read_parquet(str(named_var_paths[dataset_id])).sort("origin_index")
+            dataset_id: cls._sorted_var_df(
+                pl.read_parquet(str(named_var_paths[dataset_id])),
+                dataset_id,
+            )
             for dataset_id in order
         }
         named_hvg_rank_dfs = {
@@ -47,6 +50,20 @@ class FeatureRegistry:
         )
 
     @staticmethod
+    def _sorted_var_df(var_df: pl.DataFrame, ds_id: str) -> pl.DataFrame:
+        if "origin_index" not in var_df.columns:
+            return var_df
+        try:
+            normalized = var_df.with_columns(
+                pl.col("origin_index").cast(pl.Int64, strict=True).alias("origin_index")
+            )
+        except Exception as exc:
+            raise ValueError(
+                f"canonical var parquet for dataset '{ds_id}' has non-numeric origin_index"
+            ) from exc
+        return normalized.sort("origin_index")
+
+    @staticmethod
     def _discover_hvg_path(var_path: Path) -> Path | None:
         meta_root = var_path.parent.parent if var_path.parent.name == "canonical_meta" else var_path.parent
         hvg_path = meta_root / "hvg.parquet"
@@ -59,7 +76,7 @@ class FeatureRegistry:
     ) -> dict[str, int]:
         global_id_by_feature_id: dict[str, int] = {}
         for dataset_id in dataset_order:
-            var_df = named_var_dfs[dataset_id].sort("origin_index")
+            var_df = FeatureRegistry._sorted_var_df(named_var_dfs[dataset_id], dataset_id)
             FeatureRegistry._validate_var_df(var_df, dataset_id)
             for feature_id in var_df["canonical_gene_id"].to_list():
                 if feature_id not in global_id_by_feature_id:
@@ -92,7 +109,7 @@ class FeatureRegistry:
         self._dataset_local_hvg_rank: dict[int, np.ndarray | None] = {}
 
         for ds_idx, ds_id in enumerate(self._dataset_ids):
-            var_df = named_var_dfs[ds_id].sort("origin_index")
+            var_df = self._sorted_var_df(named_var_dfs[ds_id], ds_id)
             self._validate_var_df(var_df, ds_id)
             canonical_gene_ids = var_df["canonical_gene_id"].to_list()
             mapping = np.empty(len(var_df), dtype=np.int32)

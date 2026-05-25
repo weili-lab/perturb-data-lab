@@ -21,6 +21,52 @@ from perturb_data_lab.cli import (
 )
 
 
+def _write_compose_input_corpus(
+    root: Path,
+    *,
+    backend: str = "lance",
+    topology: str = "federated",
+    datasets: tuple[tuple[str, int], ...] = (("ds1", 2),),
+) -> None:
+    root.mkdir(parents=True)
+    records = []
+    global_start = 0
+    for dataset_index, (dataset_id, cell_count) in enumerate(datasets):
+        (root / dataset_id / "meta").mkdir(parents=True)
+        (root / dataset_id / "matrix").mkdir(parents=True)
+        (root / dataset_id / "meta" / "materialization-manifest.yaml").write_text(
+            "kind: materialization-manifest\n",
+            encoding="utf-8",
+        )
+        global_end = global_start + cell_count
+        records.append(
+            {
+                "dataset_id": dataset_id,
+                "join_mode": "create_new" if dataset_index == 0 else "append_routed",
+                "manifest_path": f"{dataset_id}/meta/materialization-manifest.yaml",
+                "dataset_index": dataset_index,
+                "cell_count": cell_count,
+                "global_start": global_start,
+                "global_end": global_end,
+            }
+        )
+        global_start = global_end
+
+    (root / "corpus-index.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "kind": "corpus-index",
+                "contract_version": "0.3.0",
+                "corpus_id": root.name,
+                "global_metadata": {"backend": backend, "topology": topology},
+                "datasets": records,
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Parser construction tests
 # ---------------------------------------------------------------------------
@@ -125,6 +171,20 @@ class TestParserConstruction:
         assert ns.input_dir == "/data/h5ad/"
         assert ns.inspection_summary_dir == "/data/reviews/"
         assert ns.dry_run is True
+
+    def test_corpus_compose_defaults_to_symlink(self):
+        parser = build_parser()
+        ns = parser.parse_args([
+            "corpus-compose",
+            "--input-corpus", "/corpus_a",
+            "--input-corpus", "/corpus_b",
+            "--dataset-id", "datasetA",
+            "--output-corpus", "/out",
+        ])
+        assert ns.command == "corpus-compose"
+        assert ns.input_corpus == ["/corpus_a", "/corpus_b"]
+        assert ns.dataset_id == ["datasetA"]
+        assert ns.link_mode == "symlink"
 
     def test_materialize_parses_ambiguous_input(self):
         """--source + --input-list are both accepted by parser
@@ -629,6 +689,80 @@ class TestCorpusValidateCmd:
         _cmd_corpus_validate(args)
         captured = capsys.readouterr()
         assert "PASS" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# Corpus-compose command tests
+# ---------------------------------------------------------------------------
+
+
+class TestCorpusComposeCmd:
+    """Test corpus-compose command."""
+
+    def test_compose_selected_datasets_as_symlinks(self, tmp_path: Path, capsys):
+        from perturb_data_lab.cli import _cmd_corpus_compose
+
+        source = tmp_path / "source"
+        output = tmp_path / "output"
+        _write_compose_input_corpus(
+            source,
+            datasets=(("datasetA", 2), ("datasetB", 3), ("datasetC", 4)),
+        )
+
+        args = argparse.Namespace(
+            input_corpus=[str(source)],
+            output_corpus=str(output),
+            dataset_id=["datasetA", "datasetC"],
+            link_mode="symlink",
+            corpus_id=None,
+        )
+        _cmd_corpus_compose(args)
+
+        assert (output / "datasetA").is_symlink()
+        assert not (output / "datasetB").exists()
+        assert (output / "datasetC").is_symlink()
+        index = yaml.safe_load((output / "corpus-index.yaml").read_text(encoding="utf-8"))
+        assert index["global_metadata"] == {"backend": "lance", "topology": "federated"}
+        assert [d["dataset_id"] for d in index["datasets"]] == ["datasetA", "datasetC"]
+        assert [d["dataset_index"] for d in index["datasets"]] == [0, 1]
+        assert [d["global_start"] for d in index["datasets"]] == [0, 2]
+        assert [d["global_end"] for d in index["datasets"]] == [2, 6]
+        captured = capsys.readouterr()
+        assert "corpus-compose" in captured.out
+
+    def test_compose_rejects_backend_mismatch(self, tmp_path: Path):
+        from perturb_data_lab.cli import _cmd_corpus_compose
+
+        source_a = tmp_path / "source_a"
+        source_b = tmp_path / "source_b"
+        _write_compose_input_corpus(source_a, backend="lance", datasets=(("datasetA", 2),))
+        _write_compose_input_corpus(source_b, backend="zarr", datasets=(("datasetB", 2),))
+
+        args = argparse.Namespace(
+            input_corpus=[str(source_a), str(source_b)],
+            output_corpus=str(tmp_path / "output"),
+            dataset_id=None,
+            link_mode="symlink",
+            corpus_id=None,
+        )
+        with pytest.raises(ValueError, match="backend mismatch"):
+            _cmd_corpus_compose(args)
+
+    def test_compose_rejects_aggregate_corpus(self, tmp_path: Path):
+        from perturb_data_lab.cli import _cmd_corpus_compose
+
+        source = tmp_path / "source"
+        _write_compose_input_corpus(source, topology="aggregate", datasets=(("datasetA", 2),))
+
+        args = argparse.Namespace(
+            input_corpus=[str(source)],
+            output_corpus=str(tmp_path / "output"),
+            dataset_id=None,
+            link_mode="symlink",
+            corpus_id=None,
+        )
+        with pytest.raises(ValueError, match="only supports federated"):
+            _cmd_corpus_compose(args)
 
 
 # ---------------------------------------------------------------------------
