@@ -1,498 +1,178 @@
 # perturb-data-lab
 
-Corpus-first preprocessing and runtime-loading system for large-scale perturb-seq training.
+`perturb-data-lab` is a corpus-first preprocessing and loading workspace for
+large perturb-seq datasets. It turns raw `.h5ad` files into sparse on-disk
+corpora, adds reviewed canonical metadata, and exposes a common runtime API for
+model training or downstream analysis.
 
-## Current scope
+The current repo is intentionally lightweight. It is not a polished Python
+package with a large compatibility surface; it is a practical framework for
+inspecting real datasets, materializing count matrices safely, and loading the
+resulting corpora.
 
-- inspect real h5ad metadata and count-source candidates without eager matrix materialization
-- materialize new corpora and later append datasets through the public CLI
-- keep materialization count-first and schema-independent
-- draft and finalize canonical schemas after materialization, then canonicalize corpus metadata
-- backfill canonical `hvg.parquet` ranking tables for existing Lance corpora without reopening source h5ad files
-- expose a corpus-level `load_corpus()` / `Corpus` runtime API for unified access
-- expose a pertTF-local adapter path and Marson/Xorion smoke workflow without modifying `pertTF`
-- keep Lance and Zarr as the maintained slim-main backends, with aggregate Lance as the production-default path
+## Current Workflow
 
-## Repo layout
+```text
+raw h5ad
+  -> inspect
+  -> materialize counts + raw sidecars
+  -> draft/review final-schema.yaml
+  -> canonicalize
+  -> load_corpus()
+  -> optional pertTF loader, AnnData handoff, or streamed pp helpers
+```
+
+The main public CLI commands are:
+
+- `inspect`: profile one or more `.h5ad` files and write `dataset-summary.yaml`
+- `materialize`: write sparse count data, raw metadata sidecars, manifests, and corpus registration records
+- `draft-schema`: create a starting `draft-schema.yaml` from materialized raw sidecars
+- `canonicalize`: apply reviewed `final-schema.yaml` files and write canonical obs/var parquet files
+- `corpus-validate`: check corpus index and manifest consistency
+- `corpus-compose`: build a new federated corpus by symlinking or copying whole dataset directories
+- `recalc-hvg`: recalculate per-dataset `hvg.parquet` ranking tables
+- `corpus-gc`: remove unregistered per-dataset directories after failed corpus writes
+
+## Supported Corpus Routes
+
+The maintained storage backends are:
+
+- `lance`
+- `zarr`
+
+The maintained topologies are:
+
+- `aggregate`: one shared matrix root with per-dataset metadata under `meta/<dataset_id>/`
+- `federated`: one self-contained directory per dataset under `<dataset_id>/`
+
+Recommended default: aggregate Lance.
+
+Use Zarr when chunked array artifacts or node-local staging are useful. Use
+federated topology when whole-dataset movement, recomposition, or isolation is
+more important than a single aggregate matrix object.
+
+See `docs/backend_note.md` for the short backend policy note.
+
+## Repo Layout
 
 ```text
 perturb-data-lab/
+├── README.md
+├── DESIGN.md
 ├── docs/
-│   ├── git-workflow.md
-│   ├── phase-01-contract-blueprint.md
-│   └── phase-02-inspector-workflow.md
+│   ├── inspect_materialize.md
+│   ├── canonicalization_handbook.md
+│   ├── perttf_loader.md
+│   ├── anndata_scanpy_handoff.md
+│   └── backend_note.md
 ├── examples/
-│   └── contracts/
-├── src/
-│   └── perturb_data_lab/
-│       ├── contracts.py
-│       ├── inspectors/
-│       ├── materializers/         # corpus materialization writers and manifests
-│       ├── loaders/
-│       │   ├── corpus_loader.py  # load_corpus(), Corpus, sampler/loader API
-│       │   ├── loaders.py        # datasets, samplers, collate helpers
-│       │   └── corpus.py         # legacy raw parquet utilities
-│       └── pp/                   # streamed per-dataset stats/HVG/PCA/DE helpers
-├── tests/
-└── pyproject.toml
+├── scripts/
+│   └── optional smoke and validation utilities
+├── src/perturb_data_lab/
+│   ├── cli.py
+│   ├── inspectors/
+│   ├── materializers/
+│   ├── canonical/
+│   ├── loaders/
+│   └── pp/
+└── tests/
 ```
 
-## Current outputs
-
-- `src/perturb_data_lab/cli.py`: public `inspect`, `materialize`, `draft-schema`, `canonicalize`, `recalc-hvg`, `corpus-validate`, and `corpus-gc` entrypoints
-- `src/perturb_data_lab/inspectors/`: inspection models, count-source audits, recovery classification, and review-bundle generation
-- `src/perturb_data_lab/materializers/`: create/append corpus writers, aggregate/federated backends, and manifests
-- `src/perturb_data_lab/canonical/`: draft/final schema application and canonical obs/var generation
-- `src/perturb_data_lab/loaders/corpus_loader.py`: `load_corpus()` and `Corpus` for unified runtime access
-- `src/perturb_data_lab/pp/`: backend-agnostic streamed per-dataset stats, HVG, IncrementalPCA, and Welch DE helpers
-- `scripts/perttf_marson_xorion_smoke.py`: bounded full-corpus public-loader smoke for Marson/Xorion
-- `docs/v0-onboarding-workflow.md`: current inspect → materialize → draft-schema → finalize-schema → canonicalize → load workflow
-- `docs/canonicalization_handbook.md`: canonical schema review rules, transform behavior, tokenizer notes, and common failure modes
-- `docs/perttf_marson_xorion_adapter_smoke.md`: user-facing handoff notes for the pertTF-local adapter smoke path
-- `docs/anndata_scanpy_handoff.md`: counts-only AnnData extraction, deterministic subsampling, Scanpy handoff, and IncrementalPCA examples
-- `docs/v0-default-backend-decision.md`: current backend policy and default/experimental guidance
-- `tests/`: focused regression and runtime smoke coverage
-
-## Preferred onboarding workflow
-
-The public workflow is now:
-
-```text
-inspect
-→ materialize
-→ draft-schema
-→ finalize final-schema.yaml
-→ canonicalize
-→ load_corpus
-```
-
-Important constraints:
-
-- Materialization is count-first and does **not** require finalized canonical schema inputs.
-- Canonical metadata is required before `load_corpus()` succeeds.
-- For large h5ad inputs, run inspection/materialization on Slurm CPU in `torch_flashv3`.
-- Treat `data/`, `pertTF/`, and `perturb/` as read-only sources; write outputs only to repo-local real directories.
-
-See `docs/v0-onboarding-workflow.md` for concrete create/append CLI examples and `docs/canonicalization_handbook.md` for draft-to-final schema review guidance.
-
-### Materialization-time obs filtering
-
-Add the dataset-summary `obs_filter:` field when you want to materialize only a
-safe subset of cells before expression emission:
-
-```yaml
-obs_filter: "cell_line_or_type == 'T_cell' and donor_id in ['D1', 'D2'] and disease_state is not null"
-```
-
-- Supported filter language is intentionally small: comparisons, `is null`,
-  `is not null`, `in [...]`, `not in [...]`, `and`, `or`, and parentheses.
-- Filtering is applied before expression, raw obs, and size-factor emission.
-- Filtered raw-obs outputs preserve `source_row_index` and `source_obs_index`
-  so retained cells still map back to the original source rows.
-- Keep materialized outputs in repo-local real directories only; never write
-  generated artifacts into the read-only `data/`, `pertTF/`, or `perturb/`
-  symlink roots.
-
-## Preferred corpus-first API
-
-Recommended policy:
-
-- **Default production path:** aggregate Lance
-- **Optional node-local staging path:** aggregate Zarr when chunked array artifacts are operationally preferable
-- **Also supported on slim main:** federated Lance and federated Zarr through the same `load_corpus(...)` API
-- **Removed from slim main:** Arrow/Parquet/HF/WebDataset/TileDB/CSR runtime and materialization routes
-
-`load_corpus(path)` reconstructs a corpus from canonical metadata plus backend artifacts and exposes one backend-neutral runtime API across those supported routes.
-
-Removed backend code and the legacy truncated-SVD PCA route are preserved only on the local experimental snapshot branch `experimental/all-backends-pre-slim-20260514`; no remote branch is implied by this repository README.
-
-```python
-from perturb_data_lab.loaders import load_corpus
-
-corpus = load_corpus("/path/to/corpus")
-corpus.set_sampler(batch_size=128, seed=0)
-
-dataset = corpus.dataset()  # ExpressionBatchDataset for custom loaders
-
-for batch in corpus.loader(seq_len=1024, processing="gpu", num_workers=4):
-    ...
-```
-
-- `load_corpus(...)` no longer accepts `seq_len`; pass it to `corpus.loader(...)`
-  or to an explicit sparse pipeline.
-- `corpus.set_sampler(...)` stores a sampler that `corpus.loader(...)` reuses when
-  that loader call does not provide sampler-local overrides.
-- If no sampler is stored and no loader-local sampler config is passed,
-  `corpus.loader(...)` uses a default random sampler with `batch_size=128`.
-
-### Canonical metadata loading defaults
-
-```python
-from perturb_data_lab.loaders import load_corpus
-
-corpus = load_corpus("/path/to/corpus")
-
-corpus_with_extra = load_corpus(
-    "/path/to/corpus",
-    extra_metadata_columns=["raw_cell_type", "donor_age"],
-)
-```
-
-- `load_corpus(...)` now projects only canonical/core columns from
-  `canonical-obs.parquet` by default instead of eagerly loading every stored
-  column.
-- Use `extra_metadata_columns=[...]` when a downstream workflow needs specific
-  extra canonical-obs columns; missing requested extras fail early.
-- Canonical string columns normalize null-like literals such as `"NA"`,
-  `"null"`, `"."`, and empty strings at read time.
-- Canonicalization write behavior is unchanged: the on-disk canonical parquet
-  files are not rewritten or normalized by `load_corpus(...)`.
-
-### pertTF paired loader
-
-```python
-from perturb_data_lab.loaders import (
-    PertTFAdapterConfig,
-    PertTFPairedBatchLoader,
-    load_corpus,
-)
-
-corpus = load_corpus("/path/to/corpus")
-perttf_loader = PertTFPairedBatchLoader(
-    corpus,
-    batch_size=8,
-    seq_len=1024,
-    config=PertTFAdapterConfig(
-        control_labels=("WT",),
-        label_fields={
-            "perturb_label": "perturbation",
-            "cell_context": "celltype",
-            "batch_id": "batch",
-            "dataset_index": "dataset",
-        },
-        perturbation_label="perturbation",
-        pairing_group_labels=("dataset", "celltype"),
-    ),
-    num_workers=2,
-)
-
-for batch in perttf_loader:
-    train_step(batch)
-```
-
-- `PertTFPairedBatchLoader` yields final pertTF-ready batch dictionaries; normal
-  callers do not need to assemble raw pair requests or call
-  `build_from_raw_pair_batch(...)` directly.
-- `label_fields` maps metadata columns to the final `{label_name}_labels` /
-  `{label_name}_labels_next` batch keys.
-- Default pairing only treats the configured perturbation label as semantic; it
-  does **not** automatically force same-dataset or same-celltype matches.
-- If you want same-dataset pairing, add `"dataset_index": "dataset"` to
-  `label_fields` and set `pairing_group_labels=("dataset",)`.
-- If you want same-dataset plus same-celltype pairing, set
-  `pairing_group_labels=("dataset", "celltype")` as in the example above.
-- The retained slim-main pertTF public surface is `PertTFAdapterConfig`,
-  `PertTFCorpusAdapter`, `PerturbationPairBatch`, `PerturbationPairSampler`,
-  `PertTFPairedBatchBuilder`, and `PertTFPairedBatchLoader`, all re-exported
-  from `perturb_data_lab.loaders`.
-- By default, rows with nulls in configured label fields are dropped once during
-  loader construction. Use `encode_null_labels=(...)` to keep a label as
-  `"<null>"`, or `error_null_labels=(...)` when you want nulls to raise.
-- `set_epoch(epoch)` is available for deterministic reshuffling between epochs.
-- When `num_workers > 0`, the loader keeps pair planning in the main process and
-  uses worker processes only for source/target expression reads.
-
-### Metadata and inspection helpers
-
-```python
-meta = corpus.take_metadata(
-    [0, 10, 24],
-    columns=["dataset_id", "local_row_index", "perturb_label"],
-)
-
-raw_batch = corpus.inspect_batch(
-    [0, 10, 24],
-    metadata_columns=["dataset_id", "perturb_label"],
-)
-
-for batch in corpus.loader(
-    processing="cpu",
-    seq_len=1024,
-    num_workers=4,
-    metadata_columns=["dataset_id", "perturb_label", "local_row_index"],
-):
-    meta_columns = batch["meta_columns"]
-    ...
-```
-
-- `corpus.take_metadata(...)` is the easiest way to recover provenance fields such
-  as `local_row_index` from global row indices.
-- `corpus.inspect_batch(...)` returns the raw flat expression batch plus optional
-  metadata columns for spot checks and debugging.
-- `corpus.loader(metadata_columns=...)` attaches rich metadata after sparse
-  processing, so workers stay expression-only.
-
-### Custom row subsets and pertTF pairing pools
-
-```python
-from perturb_data_lab.loaders import PerturbationPairSampler
-
-row_subset = [0, 3, 10, 22]
-
-for batch in corpus.loader(
-    seq_len=1024,
-    row_indices=row_subset,
-    metadata_columns=["dataset_id", "perturb_label"],
-):
-    ...
-
-pair_sampler = PerturbationPairSampler(
-    corpus.metadata_index,
-    batch_size=64,
-    source_indices=row_subset,
-    target_candidate_indices=[0, 3, 10, 41, 52],
-)
-```
-
-- `row_indices` are corpus-global row positions; they restrict loader/sampler
-  candidate pools without rebuilding the full metadata index.
-- On `PertTFPairedBatchLoader`, `row_indices=...` is the simple public shortcut:
-  when explicit `source_indices` / `target_candidate_indices` are omitted, both
-  source and target candidate pools default to that row subset.
-- `source_indices` restrict which rows can be sampled as pertTF sources.
-- `target_candidate_indices` restrict valid paired targets after the same label
-  filtering step and can be provided with or without explicit `source_indices`.
-- Pairing constraints come only from `pairing_group_labels`; leave it empty for
-  default cross-dataset pairing, or add labels such as `dataset` / `celltype`
-  when you want those groups matched.
-
-### Stored sampler reuse and loader-local override warning
-
-```python
-import warnings
-
-corpus.set_sampler(batch_size=256, seed=0)
-
-loader = corpus.loader(seq_len=2048)
-first_batch = next(loader)
-
-with warnings.catch_warnings(record=True) as caught:
-    warnings.simplefilter("always")
-    override_loader = corpus.loader(seq_len=2048, batch_size=64)
-    override_batch = next(override_loader)
-
-warning_messages = [str(item.message) for item in caught]
-```
-
-- `loader` reuses the stored sampler because no loader-local sampler arguments were
-  supplied.
-- `override_loader` uses the loader-local `batch_size=64` sampler for that call and
-  emits a `UserWarning` because it overrides the stored sampler.
-
-### Custom DataLoader composition
-
-```python
-from functools import partial
-
-from torch.utils.data import DataLoader
-
-from perturb_data_lab.loaders import (
-    GPUSparsePipeline,
-    collate_expression_batch,
-    collate_expression_batch_cpu,
-)
-
-dataset = corpus.dataset()  # ExpressionBatchDataset
-sampler = corpus.set_sampler(batch_size=256, seed=0)
-
-gpu_loader = DataLoader(
-    dataset,
-    batch_sampler=sampler,
-    collate_fn=collate_expression_batch,
-)
-
-cpu_loader = DataLoader(
-    dataset,
-    batch_sampler=sampler,
-    num_workers=4,
-    persistent_workers=True,
-    collate_fn=partial(
-        collate_expression_batch_cpu,
-        pipeline=GPUSparsePipeline(corpus.feature_registry, seq_len=2048),
-    ),
-)
-
-gpu_batch = next(iter(gpu_loader))
-cpu_batch = next(iter(cpu_loader))
-```
-
-- Use `collate_expression_batch` when you want the raw expression batch tensors and
-  will run sparse processing later in the main process.
-- Use `collate_expression_batch_cpu` when you want sparse processing to happen in
-  DataLoader workers.
-
-### Runtime notes
-
-- Aggregate and federated corpora share the same public API; topology-specific
-  routing stays internal.
-- `corpus.dataset()` exposes the backend-neutral expression dataset contract used
-  by `corpus.loader(...)`.
-- Compatible backends read expression through
-  `read_expression_flat(global_indices) -> ExpressionBatch`.
-- `corpus.loader(processing="gpu")` reads expression in the DataLoader and runs
-  sparse processing in the main process.
-- `corpus.loader(processing="cpu")` runs sparse processing in CPU workers and
-  returns processed batches to the main process.
-- `size_factor` is optional metadata/pass-through, not a required sparse-processing
-  input.
-- Lance-backed loaders default to `multiprocessing_context="spawn"` for worker
-  safety.
-
-## Streamed `pp` helpers
-
-```python
-from perturb_data_lab.pp import (
-    calculate_hvgs,
-    calculate_lognorm_stats,
-    rank_genes_ttest,
-    run_pca,
-)
-
-output_dir = "./artifacts/pp"
-
-stats = calculate_lognorm_stats(corpus, batch_size=2048, output_dir=output_dir)
-hvg_frame = calculate_hvgs(corpus, batch_size=2048, n_hvg=2000)
-pca = run_pca(
-    corpus,
-    batch_size=2048,
-    n_components=32,
-    hvg_frame=hvg_frame,
-    output_dir=output_dir,
-    overwrite=True,
-)
-de = rank_genes_ttest(
-    corpus,
-    control_label="CRISPR_control",
-    batch_size=2048,
-    top_k=50,
-    output_dir=output_dir,
-    overwrite=True,
-)
-```
-
-- `calculate_lognorm_stats(...)` streams `log1p(count / size_factor)` summary
-  stats and can write per-dataset `lognorm-stats.parquet` outputs plus
-  provenance sidecars.
-- `calculate_hvgs(...)` returns a ranked per-dataset HVG frame that can be fed
-  into `run_pca(..., hvg_frame=...)`.
-- `run_pca(...)` uses centered `method="incremental_pca"` as the slim-main
-  streamed PCA route for bounded dense batches when `scikit-learn` is
-  installed (for example via `pip install ".[pca]"`). The legacy
-  `method="truncated_svd"` path is preserved only on the local experimental
-  snapshot branch `experimental/all-backends-pre-slim-20260514`.
-- `rank_genes_ttest(...)` runs streamed per-dataset Welch DE against an
-  explicit control label and writes top-k `ttest-degs.parquet` artifacts when
-  `output_dir` is set.
-- Write generated `pp` outputs only to repo-local real directories such as
-  `./artifacts/pp`, never into the protected `data/`, `pertTF/`, or
-  `perturb/` symlink roots.
-
-## Counts-only AnnData handoff and bounded PCA
-
-```python
-from perturb_data_lab.loaders import load_corpus, select_obs_indices
-from perturb_data_lab.pp import calculate_hvgs, run_pca
-
-corpus = load_corpus(
-    "/path/to/corpus",
-    extra_metadata_columns=["donor_id"],
-)
-
-estimate = corpus.to_anndata(
-    dataset_id="replogle_k562",
-    obs_columns=["perturb_label", "donor_id"],
-    dry_run=True,
-    max_memory_bytes=8_000_000_000,
-    on_exceed="warn",
-)
-
-fit_selection = select_obs_indices(
-    corpus,
-    dataset_id="replogle_k562",
-    strategy="balanced",
-    max_cells=20_000,
-    stratify_by=["perturb_label"],
-    max_per_group=500,
-    seed=7,
-)
-
-adata = corpus.to_anndata(
-    dataset_id="replogle_k562",
-    row_indices=fit_selection.row_indices,
-    obs_columns=["perturb_label", "donor_id"],
-)
-
-hvg_frame = calculate_hvgs(corpus, dataset_id="replogle_k562", batch_size=1024, n_hvg=2000)
-pca = run_pca(
-    corpus,
-    dataset_id="replogle_k562",
-    method="incremental_pca",
-    batch_size=1024,
-    n_components=50,
-    hvg_frame=hvg_frame,
-    fit_row_indices=fit_selection.row_indices,
-    max_dense_batch_bytes=2_000_000_000,
-    output_dir="./artifacts/pp/replogle-ipca",
-    overwrite=True,
-)
-```
-
-- `corpus.to_anndata(...)` is eager per-dataset in-memory extraction; run
-  `dry_run=True` first and set `max_memory_bytes` before materializing large
-  selections.
-- The exported `AnnData` is counts-only: `adata.X` is CSR raw counts and the
-  corpus runtime does not create normalized or log-transformed `.layers`.
-- Use `corpus.select_obs_indices(...)` or `select_obs_indices(corpus, ...)`
-  for deterministic `random`, `stratified`, or `balanced` row subsets that can
-  feed both `to_anndata(...)` and `run_pca(...)`.
-- `run_pca(method="incremental_pca")` is the bounded-memory centered PCA route;
-  use corpus-native streamed `pp` helpers when you want to stay on-disk rather
-  than handing a subset to Scanpy.
-- Scanpy remains user-managed rather than a core dependency; install and call it
-  after AnnData construction in your analysis environment.
-- Keep generated outputs in repo-local real directories such as
-  `./artifacts/pp/...`; never write them under `data/`, `pertTF/`, or
-  `perturb/`.
-
-See `docs/anndata_scanpy_handoff.md` for focused dry-run, subsampling, Scanpy,
-and IncrementalPCA examples.
-
-## Migration note
-
-- Preferred usage is corpus-centric: `load_corpus(...)`, `corpus.set_sampler(...)`,
-  `corpus.dataset()`, `corpus.loader(...)`, `corpus.read_expression(...)`,
-  `corpus.take_metadata(...)`, and `corpus.inspect_batch(...)`.
-- Legacy executor-centric guidance is intentionally gone; use
-  `corpus.inspect_batch(...)` for raw batch inspection and
-  `corpus.loader(processing="gpu" | "cpu", ...)` for training-time iteration.
-- Readers are flat-only; runtime code should prefer `Corpus.read_expression(...)`
-  or backend `read_expression_flat(...)` for direct expression access.
-
-## Running the inspector
-
-Batch mode remains available:
-
-```bash
-PYTHONPATH=src python -m perturb_data_lab.inspectors.cli --config /path/to/inspection-config.yaml --workers 3
-```
-
-The preferred public entrypoint for a single dataset is:
+Important code areas:
+
+- `src/perturb_data_lab/cli.py`: public command-line entry points
+- `src/perturb_data_lab/inspectors/`: backed `.h5ad` metadata and count-source inspection
+- `src/perturb_data_lab/materializers/`: count-matrix streaming, backend writers, manifests, and corpus registration
+- `src/perturb_data_lab/canonical/`: schema drafting, schema contracts, transforms, and canonicalization runner
+- `src/perturb_data_lab/loaders/`: `load_corpus()`, expression readers, metadata index, feature registry, samplers, and pertTF adapter
+- `src/perturb_data_lab/pp/`: streamed stats, HVG, PCA, and differential-expression helpers
+
+## Documentation Map
+
+- Architecture and data flow: `DESIGN.md`
+- Inspection and materialization how-to: `docs/inspect_materialize.md`
+- Canonical schema review and canonicalization details: `docs/canonicalization_handbook.md`
+- pertTF-specific paired loader usage: `docs/perttf_loader.md`
+- AnnData, Scanpy, deterministic subsampling, and streamed PCA: `docs/anndata_scanpy_handoff.md`
+- Backend policy note: `docs/backend_note.md`
+
+## Minimal CLI Example
+
+Inspect one dataset:
 
 ```bash
 PYTHONPATH=src python -m perturb_data_lab.cli inspect \
   --source /path/to/dataset.h5ad \
   --dataset-id my_dataset \
-  --output-dir /path/to/review/my_dataset
+  --output-dir ./artifacts/review
 ```
 
-Real large h5ad inspection should run on Slurm CPU in the `torch_flashv3` environment.
+Materialize it into a new aggregate Lance corpus:
+
+```bash
+PYTHONPATH=src python -m perturb_data_lab.cli materialize \
+  --mode create \
+  --source /path/to/dataset.h5ad \
+  --dataset-id my_dataset \
+  --inspection-summary ./artifacts/review/my_dataset/dataset-summary.yaml \
+  --output-corpus ./artifacts/corpus \
+  --backend lance \
+  --topology aggregate
+```
+
+Draft and review canonical metadata:
+
+```bash
+PYTHONPATH=src python -m perturb_data_lab.cli draft-schema \
+  --corpus ./artifacts/corpus
+```
+
+Edit `draft-schema.yaml` into `final-schema.yaml`, then canonicalize:
+
+```bash
+PYTHONPATH=src python -m perturb_data_lab.cli canonicalize \
+  --corpus ./artifacts/corpus
+```
+
+Load the corpus:
+
+```python
+from perturb_data_lab.loaders import load_corpus
+
+corpus = load_corpus("./artifacts/corpus")
+expr = corpus.read_expression([0, 1, 2])
+meta = corpus.take_metadata([0, 1, 2], columns=["dataset_id", "perturb_label"])
+```
+
+## Runtime API Sketch
+
+```python
+from perturb_data_lab.loaders import load_corpus
+
+corpus = load_corpus("/path/to/corpus")
+
+corpus.set_sampler(batch_size=128, seed=0)
+
+for batch in corpus.loader(seq_len=1024, processing="gpu", num_workers=4):
+    train_step(batch)
+```
+
+Useful runtime methods:
+
+- `corpus.read_expression(global_row_indices)`: read sparse expression rows
+- `corpus.take_metadata(global_row_indices, columns=[...])`: read canonical metadata columns
+- `corpus.inspect_batch(global_row_indices, metadata_columns=[...])`: inspect expression plus metadata together
+- `corpus.loader(...)`: build an iterable sparse batch loader
+- `corpus.to_anndata(...)`: eager counts-only AnnData export for one dataset or subset
+
+By default, `load_corpus()` loads core canonical metadata. Pass
+`extra_metadata_columns=[...]` when a downstream workflow needs additional
+canonical obs columns.
+
+## Safety Notes
+
+- Treat raw `.h5ad` sources as read-only.
+- For large `.h5ad` files, run inspection and materialization on Slurm CPU using the project environment.
+- Do not write outputs into protected symlink roots such as `data/`, `pertTF/`, or `perturb/`.
+- Materialization does not apply obs filtering. If only a subset of cells should be materialized, create a pre-filtered `.h5ad` first.
+- Canonicalization is a reviewed metadata step. Do not blindly promote every raw field into a canonical field.

@@ -1,739 +1,225 @@
-# perturb-data-lab Design Narrative
+# perturb-data-lab Design
 
-## Status
+This document describes how the current repository works. It is not a future
+plan and it does not document removed backend experiments.
 
-This document is the architecture narrative for the next cleanup and rebuild of `perturb-data-lab`.
+`perturb-data-lab` has one main job: turn raw perturb-seq `.h5ad` files into a
+corpus that can be loaded consistently for model training or analysis.
 
-It is intentionally not a concrete implementation plan. Instead, it defines:
+## Core Ideas
 
-- what the system is supposed to do
-- where the current codebase is structurally confused
-- what the target data flow should be
-- how backend format and corpus topology should be separated
-- how the cleanup should be understood through the 3(4)-step sequence
+- A **dataset** is one source `.h5ad` plus its materialized matrix, raw metadata sidecars, canonical metadata, and manifest.
+- A **corpus** is a collection of datasets registered in one `corpus-index.yaml`.
+- A **backend** is the physical matrix format. Current maintained choices are `lance` and `zarr`.
+- A **topology** is how datasets are organized. Current choices are `aggregate` and `federated`.
+- **Raw sidecars** preserve what the source dataset contained.
+- **Canonical sidecars** are reviewed, loader-ready views of obs/var metadata.
+- **Heavy expression data** stays sparse and stores dataset-local feature indices.
+- **Feature alignment** happens at runtime from `canonical-var.parquet`, not by rewriting materialized expression rows.
 
-The 3(4)-step sequence is:
+Backend and topology are separate axes:
 
-1. inspection and materialization approval
-2. materialization and corpus registration
-3.1 simple dataloading
-3.2 full dataloading methods
-
-The goal is to make later detailed plans easy to derive from one stable design story.
-
-## Problem Statement
-
-The current repository has useful pieces, but the end-to-end system is difficult to reason about because several architectural generations are visible at once.
-
-The main symptoms are:
-
-- inspection is doing both lightweight evidence gathering and heavy schema drafting
-- materialization is partly tokenizer-free and partly still surrounded by tokenizer-era artifacts
-- corpus runtime loading uses some materialized outputs directly and ignores some corpus-level canonicalization outputs
-- feature identity, token identity, and dataset-local feature order are not cleanly separated
-- backend storage format and corpus topology are mixed together in backend names and reader/writer logic
-- some code remains only for tests, backward compatibility, or unfinished migration paths
-
-The result is not just bugs. The result is that the intended data flow is hard to describe in one sentence.
-
-This document fixes that by defining one clean narrative.
-
-## Core Principles
-
-The redesigned system should follow these principles.
-
-### Materialize first, canonicalize later
-
-Materialization should not depend on a finalized cross-dataset metadata contract or a finalized shared feature vocabulary.
-
-Materialization should preserve dataset-local truth and produce durable artifacts that can later support canonicalization.
-
-### Counts first
-
-The first hard requirement is always the expression matrix:
-
-- find a valid integer count source
-- preserve sparse structure
-- write counts efficiently
-- keep feature indices dataset-local at write time
-
-Everything else is secondary to getting counts into a correct durable form.
-
-### Preserve raw dataset truth
-
-The system should preserve:
-
-- raw `obs`
-- raw `var`
-- source path and source release
-- chosen count source
-- dataset-local feature ordering
-
-This preserved raw truth is what later canonicalization and debugging should use.
-
-### Separate storage format from corpus topology
-
-Storage backend and corpus organization are different concerns.
-
-Storage backend answers: how are heavy rows written and read?
-
-Corpus topology answers: is each dataset stored independently or are all datasets appended into one shared heavy object?
-
-These must not be fused into one conceptual axis.
-
-### Keep runtime identity simple
-
-The stable runtime identity should be:
-
-- `global_row_index`
-- `dataset_index`
-- `dataset_id`
-- `local_row_index`
-
-`release_id` is provenance, not a hot-path join key.
-
-### Canonicalization is additive, not destructive
-
-Canonicalization should add:
-
-- canonical cell metadata
-- canonical feature metadata
-- optional dataset-local to global feature mappings
-
-It should not rewrite the meaning of already-materialized heavy rows.
-
-## Target End-to-End Story
-
-The system should be easy to explain in one end-to-end story.
-
-### Step 1: inspect a dataset
-
-A user points the system at one `.h5ad` file.
-
-The inspection layer reads the file in a lightweight mode and produces a compact review artifact that answers:
-
-- what are the dataset dimensions
-- what does `obs` look like
-- what does `var` look like
-- which matrix candidates exist among `.X`, `.raw.X`, and `.layers[...]`
-- whether a direct integer count source exists
-- whether a recoverable count source exists
-- whether the file is approved for materialization
-
-This stage is evidence gathering and approval gating only.
-
-### Step 2: materialize the dataset
-
-Once approved, materialization writes the dataset into the chosen backend and registers it in a corpus.
-
-Materialization should produce:
-
-- heavy count storage in the chosen backend
-- raw dataset metadata sidecars
-- raw feature metadata sidecars
-- dataset-local HVG artifacts
-- a proposed canonicalization schema for later review and refinement
-- a per-dataset materialization manifest
-- corpus ledger updates
-
-This is the moment the dataset becomes durable and loadable.
-
-### Step 3.1: simple dataloading
-
-After materialization, the system should support the easiest useful loading modes across all supported backends.
-
-This stage should provide:
-
-- random row sampling
-- dataset-restricted row sampling
-- metadata/context-grouped row sampling
-- sparse batch collation
-
-This stage should not require global feature identity to be settled.
-
-### Step 3.2: full dataloading methods
-
-After the simple loading path is stable, the system should support all intended gene-level and feature-level sampling modes.
-
-This includes:
-
-- random feature-context sampling
-- expressed-plus-zero sampling
-- HVG-based feature sampling
-- any canonicalized/global-feature-space loading path that is needed for tokenization or shared-vocabulary training
-
-This is the stage where feature-space semantics become explicit and enforced.
-
-## The 3(4)-Step Architecture
-
-The rest of this document expands each of those stages as architecture, not as a task list.
-
-## Stage 1: Inspection And Materialization Approval
-
-### Purpose
-
-Stage 1 exists to answer a narrow question:
-
-"Can this dataset be materialized safely, and from which count source?"
-
-It is not responsible for final canonical metadata design.
-
-### Inputs
-
-- one raw `.h5ad` path
-- a dataset identifier
-- optional source release string
-
-Large files should be inspected on Slurm CPU in the `torch_flashv3` environment, following repository execution rules.
-
-### Outputs
-
-The stage should emit a small dataset review bundle containing:
-
-- dimensions summary
-- `obs` inventory and summary
-- `var` inventory and summary
-- count-source candidate audit
-- selected count source decision
-- approval state
-
-The key point is that the primary output is an approval artifact, not a full canonical contract.
-
-### What this stage should decide
-
-This stage should decide:
-
-- whether `.X`, `.raw.X`, or a layer is the selected source
-- whether the selected source is direct integer
-- whether recovery is needed and acceptable
-- whether the dataset is ready for materialization
-
-### What this stage should not decide
-
-This stage should not decide:
-
-- final corpus-global feature identity
-- final token IDs
-- final cross-dataset metadata harmonization
-- final training emission contract
-
-### Why this stage must remain small
-
-The repository currently contains too much coupling between inspection and downstream schema machinery.
-
-The cleanup direction should make Stage 1 easier to trust by keeping it small, evidence-driven, and approval-oriented.
-
-### Reference datasets for this stage
-
-The first validation targets for this architecture are:
-
-- `dummy_data/*`
-- `perturb/marson2025_data/D1_Rest.assigned_guide.h5ad`
-
-The dummy files prove the path on controlled examples.
-
-The Marson file proves the path on a real large dataset with realistic metadata complexity.
-
-## Stage 2: Materialization And Corpus Registration
-
-### Purpose
-
-Stage 2 is the durable ingestion step.
-
-After Stage 2, a dataset should exist as a stored object with enough artifacts to support:
-
-- immediate basic loading
-- later canonicalization
-- later debugging and provenance review
-
-### Inputs
-
-Stage 2 takes:
-
-- the raw `.h5ad`
-- an approved count-source decision from Stage 1
-- an output location
-- a chosen backend
-- a chosen corpus topology
-- either a new corpus request or an append-to-existing-corpus request
-
-### Core responsibilities
-
-Stage 2 must do five things.
-
-#### 1. Write counts correctly
-
-This is the primary job.
-
-Counts must be:
-
-- integer
-- sparse when possible
-- written in dataset-local feature space
-- recoverable by row without metadata re-execution
-
-Heavy rows should carry only runtime-critical count-side information.
-
-For aggregate topologies, the logical heavy-row contract is:
-
-- `global_row_index`
-- `dataset_index`
-- `local_row_index`
-- `expressed_gene_indices`
-- `expression_counts`
-
-For federated topologies, the per-dataset object carries the same fields minus the corpus-global ones.
-
-**Size factors are stored separately**, not inline in the heavy-row parquet. The size-factor sidecar is `{metadata_root}/{release_id}-size-factor.parquet` with one `float64` row per cell in the same order as the heavy rows. This separation keeps the heavy-row parquet focused on count data and allows runtime loaders to read size factors on demand without parsing non-count columns from the cells artifact.
-
-The flat-buffer Arrow list array pattern is used for the `arrow-parquet` backend: `expressed_gene_indices` and `expression_counts` are stored as a single `pa.ListArray` per row, built directly from CSR indptr/indices/data buffers via `pa.ListArray.from_arrays()` without per-row Python list construction.
-
-**`Stage2Materializer._write_cells()`** loops over the count matrix in chunks (default 100,000 rows per chunk), calls `_translate_chunk()` once per chunk to produce a `ChunkBundle`, and passes each bundle to the thin backend serializer. Each backend writer accepts a `ChunkBundle` and serializes it to its native format — writers do not implement CSR logic, do not call `_translate_chunk()`, and have no legacy fallback paths.
-
-#### 2. Preserve raw metadata
-
-Stage 2 must preserve enough raw information to rebuild or revise metadata decisions later.
-
-At minimum this means preserving:
-
-- raw `obs`
-- raw `var`
-- dataset-local feature order
-- chosen count source
-- source provenance
-
-The current repository already points in this direction, and that direction should be retained.
-
-#### 3. Save feature-side dataset artifacts
-
-Feature-side artifacts should be simple and durable.
-
-The preferred design direction is:
-
-- save dataset-local feature metadata directly from `adata.var`
-- preserve the dataset-local feature index order explicitly
-- compute HVGs after counts are settled
-- save HVGs in dataset-local feature space
-
-This is intentionally simpler than the current mixture of feature registry, token sidecars, and canonicalization-era feature outputs.
-
-#### 4. DO NOT Produce a proposed canonicalization schema
-
-No lightweight canonicalization schema
-
-#### 5. Update the corpus tracking object
-
-The corpus needs a single authoritative tracking object.
-
-This object should act as a ledger recording:
-
-- corpus identity
-- datasets present in the corpus
-- dataset append order
-- dataset index assignment
-- backend choice
-- topology choice
-- manifest locations
-- cell counts
-- global row ranges when relevant
-
-The corpus tracking object should not become an over-smart mutable metadata rewrite surface.
-
-It should remain the routing ledger.
-
-### Backend and topology must be independent
-
-The current combined backend names should be conceptually replaced by a matrix.
-
-### Storage backend axis
-
-The implemented storage backends are:
-
-- `arrow-parquet` — Arrow IPC serialized to Parquet via `pa.ipc.new_file`; flat-buffer list-arrays via `pa.ListArray.from_arrays()`
-- `arrow-ipc` — Arrow IPC serialized via `pa.ipc.new_file`; flat-buffer list-arrays via `pa.ListArray.from_arrays()`
-- `webdataset` — WebDataset `.tar` shards; per-cell pickle records; metadata Parquet per shard
-- `zarr` — Zarr 1D flat-buffer layout (all indices in one 1D array + row_offsets); pre-scan two-pass
-- `lance` — Direct `lance.write_dataset()` in create/append mode; no `lancedb` dependency; append-safe for aggregate topology
-
-This axis answers:
-
-- how rows are physically written
-- how rows are read
-- how append works
-- what access patterns are efficient
-
-### Corpus topology axis
-
-The implemented corpus topologies are:
-
-- `federated` — each dataset stored independently; global_row_index assigned at corpus-append time via ledger
-- `aggregate` — multiple datasets share one heavy object with deterministic, non-overlapping corpus-scoped row ranges
-
-This axis answers:
-
-- does each dataset have its own heavy object and routing entry
-- or do multiple datasets share one heavy object with append-safe row ranges
-
-### Shared chunk translation layer
-
-All 5 backends share a single translation unit (`chunk_translation.py`) that:
-
-1. Accepts a CSR batch (`indptr`, `indices`, `counts`) + `DatasetSpec` + `chunk_start`
-2. Translates it once into a `ChunkBundle` (6 fields: `table`, `row_sums`, `indptr`, `indices`, `counts`, `row_count`)
-   - `table`: `pa.Table` with `global_row_index`, flat-buffer list-arrays (`expressed_gene_indices`, `expression_counts`) built via `pa.ListArray.from_arrays()` directly from CSR buffers
-   - `row_sums`: float64 ndarray of raw (un-normalized) per-cell row sums — the caller accumulates these across chunks via a global array and computes globally-normalized size factors from the global median after the loop
-   - `indptr`, `indices`, `counts`: raw CSR NumPy arrays for backends that need direct buffer access
-   - `indices` are always in dataset-local feature space — no canonical gene mapping is applied at this stage; canonical mapping is deferred to Stage 3
-3. Each backend writer consumes the `ChunkBundle` and produces its own serialized format
-
-`gene_lookup` has been removed. `_translate_chunk()` accepts `dataset: DatasetSpec`, `matrix_chunk: csr_matrix`, `chunk_start: int` — no gene mapping parameter.
-
-This eliminates per-backend sparse re-encoding on the hot path and enforces a common heavy-row schema across all backends. The `metadata_table` field has been removed; per-cell metadata is written by the caller as a separate Parquet sidecar.
-
-### Common heavy-row schema
-
-All backends share the same heavy-row structure written by `_translate_chunk()` via `pa.ListArray.from_arrays()` directly from CSR buffers:
-
-```
-global_row_index: int64
-expressed_gene_indices: list<int32>   — dataset-local feature indices
-expression_counts: list<int32>       — integer counts, one per expressed gene
+```text
+backend:  lance | zarr
+topology: aggregate | federated
 ```
 
-Metadata (17 fields from `METADATA_SCHEMA`) is stored separately in the raw-obs Parquet sidecar, not in the heavy-row parquet. The `_build_metadata_table()` helper is available for callers that need to construct the metadata table from obs data.
-
-### Why this split matters
-
-This split removes a major source of current bloat.
-
-The code previously needed one conceptual backend name for each fused pair such as:
-
-- `arrow-hf` (fused backend + topology)
-- `zarr-ts` (fused backend + topology)
-- `lancedb-aggregated` (fused backend + topology + wrapper)
-
-Instead, the system now supports independent `backend` + `topology` dispatch:
-
-- `arrow-parquet` × `federated`
-- `arrow-ipc` × `federated`
-- `webdataset` × `federated`
-- `zarr` × `federated`
-- `lance` × `federated`
-- `arrow-parquet` × `aggregate`
-- `arrow-ipc` × `aggregate`
-- `webdataset` × `aggregate`
-- `zarr` × `aggregate`
-- `lance` × `aggregate`
-
-Not every backend must support every topology immediately. The design only requires that the axes be separated.
-
-### What Stage 2 should not do
-
-Stage 2 should not require:
-
-- a finalized cross-dataset feature vocabulary
-- finalized token IDs
-- finalized corpus-global feature equivalence
-- a canonicalized metadata contract to be fully settled
-
-This is the most important simplification in the new architecture.
-
-## Stage 3.1: Simple Dataloading
-
-### Purpose
-
-Stage 3.1 exists to make all backends and supported topologies immediately usable after materialization.
-
-This is the easiest loader milestone and should be achieved before any feature-space-heavy work.
-
-### Required capabilities
-
-Stage 3.1 should provide:
-
-- corpus-global row routing
-- single-row random access where the backend allows it
-- dataset iteration
-- random row sampling
-- dataset-restricted row sampling
-- metadata/context-grouped row sampling
-- sparse batch collation
-
-### Loader-facing data model
-
-The loader layer should consume:
-
-- the corpus tracking object
-- per-dataset materialization manifests
-- backend-specific heavy objects
-- metadata sidecars that were written during materialization
-
-The runtime-facing row identity should remain:
-
-- `global_row_index`
-- `dataset_index`
-- `dataset_id`
-- `local_row_index`
-
-### Metadata loading model
-
-The simplest working runtime should use:
-
-- lazy heavy-row reads from the backend
-- a lightweight RAM-resident metadata table when that improves grouping and batch routing
-
-This keeps counts I/O and metadata I/O clearly separated.
-
-### What Stage 3.1 should not require
-
-Stage 3.1 should not require:
-
-- global feature IDs
-- token IDs
-- canonicalized corpus-wide feature resolution
-- advanced gene sampling semantics
-
-If the system cannot do simple row sampling on every backend after materialization, then more advanced loader work should not begin yet.
-
-### Efficiency direction
-
-The phrase "as efficient as possible" in this stage means:
-
-- exploit backend-native grouped reads where possible
-- keep metadata reads off the heavy I/O hot path when possible
-- batch by owning dataset before issuing heavy reads
-- collate sparse rows without densifying
-
-The design target is not maximum theoretical optimization yet. The design target is backend-wide correctness with obviously sensible access patterns.
-
-## Stage 3.2: Full Dataloading Methods
-
-### Purpose
-
-Stage 3.2 settles the full training-facing loader semantics.
-
-This is where the system must support all intended sampling methods correctly and unambiguously.
-
-### Required capabilities
-
-Stage 3.2 should provide every supported sampling method, including:
-
-- random feature-context sampling
-- expressed-plus-zero sampling
-- HVG-based feature sampling
-- any other training-time feature subsampling modes the project needs
-
-### The crucial design question
-
-Stage 3.2 must explicitly define feature space.
-
-Every advanced sampling method must say whether it operates in:
-
-- dataset-local feature space
-- canonicalized/global feature space
-
-This choice cannot remain implicit.
-
-### Local-space loading
-
-Local-space loading is:
-
-- simpler
-- available immediately after materialization
-- useful for dataset-specific training or debugging
-
-Its limitation is that feature identity is not shared across datasets.
-
-### Global-space loading
-
-Global-space loading is:
-
-- needed for shared-vocabulary or tokenization-like training
-- dependent on canonicalization or an equivalent global mapping step
-- more complex but semantically stronger across datasets
-
-### HVGs must follow feature space explicitly
-
-HVG artifacts should be written in dataset-local feature space during materialization.
-
-If a global/canonicalized loader is later needed, then HVGs must be transformed into that feature space using an explicit mapping artifact.
-
-The system must not silently mix local feature indices with global feature indices.
-
-### Canonicalization's real role in Stage 3.2
-
-Canonicalization becomes important here, not earlier.
-
-If the project wants multi-dataset shared feature identity, canonicalization should produce artifacts that make this explicit, such as:
-
-- canonical cell metadata
-- canonical feature metadata
-- dataset-local to global feature mapping tables
-
-Those artifacts should feed the advanced loaders cleanly.
-
-They should not be loosely present while the loader continues to depend on older sidecars.
-
-## Role Of Canonicalization In The Overall System
-
-Canonicalization is important, but it should not be allowed to distort the main data flow.
-
-Its role is:
-
-- harmonize metadata across datasets
-- harmonize feature identity across datasets when needed
-- generate optional shared-feature loading artifacts
-
-Its role is not:
-
-- to be required before any useful loading exists
-- to rewrite historical heavy-row semantics
-- to become the place that silently changes corpus routing rules
-
-The target architecture therefore treats canonicalization as a downstream enrichment layer.
-
-Basic materialization and basic loading must still stand on their own.
-
-### Canonicalization Stage (Post-Materialization)
-
-Canonicalization runs as a separate, guided, offline step **after** all datasets have been materialized (Stage 2).  It consumes the raw obs/var sidecars written during materialization and produces pre-computed canonical metadata files that the loader can read directly, eliminating all per-row transform overhead at training time.
-
-**Position in the pipeline**:
-
-```
-Stage 1  →  Stage 2  →  Canonicalization  →  Stage 3.1/3.2
-(inspect)  (materialize)  (this stage)          (load)
+Aggregate topology stores matrix data under one corpus-level `matrix/` root and
+metadata under `meta/<dataset_id>/`. Federated topology stores each dataset as a
+self-contained `<dataset_id>/meta` and `<dataset_id>/matrix` directory.
+
+## Current Data Flow
+
+```text
+source h5ad
+  -> inspection
+  -> materialization
+  -> canonical schema review
+  -> canonicalization
+  -> load_corpus()
+  -> downstream loaders or analysis helpers
 ```
 
-**Inputs**:
+The user-facing how-to docs are split by task:
 
-- Per-dataset raw obs sidecar (`{release_id}-raw-obs.parquet`)
-- Per-dataset raw var sidecar (`{release_id}-raw-var.parquet`)
-- Per-dataset `canonicalization-schema.yaml` (human-authored transform config)
-- Per-dataset size factor sidecar (`{release_id}-size-factor.parquet`)
+- Inspection and materialization: `docs/inspect_materialize.md`
+- Canonical schema review and canonicalization: `docs/canonicalization_handbook.md`
+- pertTF paired loading: `docs/perttf_loader.md`
+- AnnData/Scanpy handoff and streamed pp helpers: `docs/anndata_scanpy_handoff.md`
+- Backend policy: `docs/backend_note.md`
 
-**Outputs**:
+## 1. Inspection
 
-- Per-dataset `{release_id}-canonical-obs.parquet` — canonical cell metadata with all must-have columns plus declared extensible columns
-- Per-dataset `{release_id}-canonical-var.parquet` — canonical feature metadata with `origin_index`, `gene_id`, `canonical_gene_id`, and `global_id`
-- Corpus-level `canonical-vocab.yaml` — deduplicated, sorted values per canonical category across all datasets
-- Corpus-level `canonical-gene-mappings.yaml` — global `gene_id → canonical_gene_id` mapping
+Inspection is the metadata-first pass over a source `.h5ad` file.
 
-**Canonical obs contract** (must-have columns):
+It reads the file in backed mode, profiles obs/var metadata, samples matrix
+sources, and writes a `dataset-summary.yaml`. It does not materialize the full
+matrix and it does not decide the final canonical schema.
 
+Inspection records:
+
+- dataset shape and source identity
+- obs and var field names, dtypes, null counts, and example values
+- matrix candidates from `.X`, `.raw.X`, and named layers
+- sampled integer/count-like behavior for each candidate
+- selected count source and whether recovery is needed
+- materialization readiness: `pass`, `needs-review`, or `fail`
+- likely control-label candidates for later schema review
+
+The materializer uses `dataset-summary.yaml` as the gate. A dataset whose
+`materialization_readiness` is not `pass` is rejected.
+
+See `docs/inspect_materialize.md` for CLI and Python examples.
+
+## 2. Materialization
+
+Materialization turns one inspected dataset into corpus artifacts.
+
+The materializer:
+
+- opens the source `.h5ad` in backed mode
+- selects the inspected count source
+- streams the matrix in row chunks
+- writes sparse count data through the selected backend and topology
+- writes raw obs and raw var sidecars
+- writes size factors and per-dataset HVG rankings
+- writes a per-dataset `materialization-manifest.yaml`
+- registers the dataset in `corpus-index.yaml`
+
+Materialization is count-first and schema-independent. It does not need a
+finalized canonical metadata schema, and it does not rewrite expression features
+into a shared global feature space.
+
+Important materialization artifacts:
+
+- `corpus-index.yaml`: corpus membership, dataset order, backend, topology, and global row ranges
+- `global-metadata.yaml`: corpus-level metadata mirror used by tools and humans
+- `materialization-manifest.yaml`: per-dataset source, output, count-source, and QA metadata
+- `raw-obs.parquet`: raw obs metadata plus stable row identity fields
+- `raw-var.parquet`: raw var metadata plus `origin_index`
+- `size-factor.parquet`: per-cell size factors
+- `hvg.parquet`: per-dataset HVG ranking table keyed by `origin_index`
+
+Materialization does not apply cell filtering. If a dataset should be filtered,
+create a pre-filtered `.h5ad` first and inspect/materialize that file.
+
+See `docs/inspect_materialize.md` for the command-line and Python APIs.
+
+## 3. Canonical Schema Review
+
+Canonicalization is the most manual part of the workflow because raw dataset
+metadata varies across sources.
+
+After materialization, `draft-schema` reads the materialized raw sidecars and
+inspection hints and writes `draft-schema.yaml`. The draft is only a starting
+point. A user or agent should review it, edit mappings, and save the approved
+schema as `final-schema.yaml`.
+
+The reviewed schema decides:
+
+- how perturbation labels are formed
+- which labels are controls
+- how cell context, assay, tissue, species, donor, batch, dose, and timepoint are represented
+- which optional raw fields are carried through as canonical extras
+- how raw feature identifiers become `gene_id` and `canonical_gene_id`
+
+See `docs/canonicalization_handbook.md` for the exact schema structure and
+review checklist.
+
+## 4. Canonicalization
+
+Canonicalization applies one `final-schema.yaml` per dataset.
+
+It reads:
+
+- `raw-obs.parquet`
+- `raw-var.parquet`
+- `size-factor.parquet` when present
+- `final-schema.yaml`
+
+It writes:
+
+- `canonical_meta/canonical-obs.parquet`
+- `canonical_meta/canonical-var.parquet`
+
+`canonical-obs.parquet` contains required loader metadata such as
+`dataset_id`, `dataset_index`, `global_row_index`, `local_row_index`,
+`perturb_label`, `cell_context`, and `size_factor`.
+
+`canonical-var.parquet` contains at least:
+
+- `origin_index`: dataset-local feature order
+- `gene_id`: raw or lightly cleaned source feature identifier
+- `canonical_gene_id`: harmonized identifier used for runtime alignment
+- `global_id`: per-dataset deterministic field written by canonicalization
+
+Runtime global feature IDs are assigned by `FeatureRegistry` when a corpus is
+loaded. The registry walks datasets in `corpus-index.yaml` order, sorts each
+`canonical-var.parquet` by numeric `origin_index`, and appends first-seen
+`canonical_gene_id` values to a corpus-global vocabulary.
+
+## 5. Runtime Loading
+
+`load_corpus(path)` reconstructs a corpus from the index, canonical metadata,
+feature metadata, and backend matrix artifacts.
+
+It builds:
+
+- an expression reader for aggregate or federated Lance/Zarr
+- a `MetadataIndex` from `canonical-obs.parquet`
+- a `FeatureRegistry` from `canonical-var.parquet` and optional `hvg.parquet`
+- a `Corpus` object that exposes public loading and inspection methods
+
+Common runtime calls:
+
+```python
+from perturb_data_lab.loaders import load_corpus
+
+corpus = load_corpus("/path/to/corpus")
+expr = corpus.read_expression([0, 1, 2])
+meta = corpus.take_metadata([0, 1, 2], columns=["dataset_id", "perturb_label"])
+batch = next(iter(corpus.loader(seq_len=1024, processing="gpu")))
 ```
-global_row_index, cell_id, dataset_id, dataset_index, local_row_index,
-size_factor, perturb_label, perturb_type, dose, dose_unit, timepoint,
-timepoint_unit, cell_context, cell_line_or_type, species, tissue, assay,
-condition, batch_id, donor_id, sex, disease_state
-```
 
-Extensible columns may be added from raw obs or external metadata files;
-all missing values become `NA` in the global frame.
+`load_corpus()` requires canonical obs/var parquet files. A materialized but
+uncanonicalized corpus is not training-ready through the public runtime API.
 
-**Canonical var contract** (must-have columns):
+## 6. Downstream Paths
 
-```
-origin_index, gene_id, canonical_gene_id, global_id
-```
+The repo has three main downstream usage paths.
 
-**Gene ID mapping** uses `gget` (pluggable, configurable per dataset) to
-convert dataset-local gene identifiers (`gene_id`) into canonical identifiers
-(`canonical_gene_id`).  When mapping is disabled or the dataset gene names are
-already in the target namespace, the mapping is identity.  A `mapping_file`
-override is supported for explicit tabular mapping.
+The generic sparse loader uses `corpus.loader(...)` and returns sparse batches
+with dataset-aware feature mapping.
 
-**Control representation**: control conditions are represented via the
-`perturb_type` field (e.g., `"control"`, `"non-targeting"`) rather than a
-separate boolean `control_flag`.  This keeps the schema flat and avoids
-implicit boolean semantics.
+The pertTF adapter uses `PertTFPairedBatchLoader` to form source/target paired
+batches with configurable labels, control definitions, row pools, and pairing
+groups. See `docs/perttf_loader.md`.
 
-**Relationship to extant schema artifacts**:
+The AnnData/Scanpy path uses `corpus.to_anndata(...)` for eager counts-only
+export of one dataset or a selected subset. Streamed `pp` helpers provide
+bounded-memory stats, HVG, PCA, and differential-expression utilities. See
+`docs/anndata_scanpy_handoff.md`.
 
-The `canonicalization-schema.yaml` is a new artifact, separate from the
-inspection-stage `SchemaDocument`.  The inspection schema maps raw fields to
-canonical fields during materialization; the canonicalization schema maps raw
-*sidecar* columns to final canonical parquet columns after materialization.
-The two artifacts serve different stages and are not coupled.
+## Corpus Management Helpers
 
-**Canonicalization schema YAML format** is defined in
-`perturb_data_lab.canonical.contract.CanonicalizationSchema`.  It is flat and
-explicit: each canonical column has a single strategy (`source-field`,
-`literal`, `passthrough`, `row-index`, `null`, `gene-mapping`, or `auto`),
-an ordered list of value transforms (from `inspectors/transforms.py`), and a
-fallback value.  No nested conditionals or implicit defaults are supported.
+`corpus-validate` checks that a corpus index and registered manifests are
+consistent.
 
-Example per-dataset schemas live alongside the plan run directory (e.g.,
-`copilot/plans/<plan-id>/schemas/<dataset_id>/canonicalization-schema.yaml`).
+`corpus-compose` creates a new federated corpus from selected whole-dataset
+directories. It supports symlink or copy mode and requires all selected inputs
+to use the same backend.
 
-## Corpus Tracking Object
+`recalc-hvg` recomputes per-dataset `hvg.parquet` rankings from an existing
+corpus and can update manifests.
 
-The design assumes one authoritative corpus tracking object.
+`corpus-gc` removes unregistered per-dataset directories after failed corpus
+writes. It is intentionally conservative and does not clean registered backend
+internals.
 
-Today this is naturally closest to `corpus-index.yaml`, but the exact file format can evolve.
+## Design Boundaries
 
-What matters is the role.
-
-The corpus tracking object should record:
-
-- corpus ID
-- backend
-- topology
-- ordered dataset membership
-- dataset index
-- materialization manifest path
-- cell count
-- global row range when relevant
-
-It may also point to optional corpus-level artifacts, but it should remain first and foremost the routing and membership ledger.
-
-The system should avoid allowing later metadata passes to accidentally erase or redefine routing-critical fields.
-
-## What Should Be Simplified Or Removed Over Time
-
-This document is not a deletion list, but the architecture does imply a cleanup direction.
-
-The likely simplification targets are:
-
-- tokenizer-era scaffolding that is no longer part of the chosen design
-- feature registry logic if raw `var` plus later canonicalization fully replaces it
-- duplicated contract models that split one concept across inspection and materialization packages
-- backend names that combine storage format and topology into one label
-- loader fallback paths that exist only because the system is supporting incompatible generations of artifacts at the same time
-
-The cleanup rule is simple:
-
-keep code that participates in the target data flow, and remove code that only preserves abandoned architecture branches.
-
-## Architecture Summary
-
-The target architecture can be summarized as follows.
-
-### Stage 1
-
-Inspect one `.h5ad`, summarize dimensions and metadata, audit count sources, and produce a materialization approval artifact.
-
-### Stage 2
-
-Materialize integer counts into a chosen backend and topology, preserve raw metadata and feature metadata, compute HVGs, and append the dataset to the corpus ledger.
-
-### Canonicalization
-
-Run per-dataset canonicalization using human-authored `canonicalization-schema.yaml` files and the `canonical/` runner.  Produce canonical obs/var parquets and a corpus-level `canonical-vocab.yaml`.  Gene ID mapping uses `gget` (pluggable, configurable per dataset).
-
-### Stage 3.1
-
-Make all backends loadable for basic row-level and batch-level access with simple sampling and sparse batch collation.  Loaders can read canonical metadata when available via a `use_canonical=True` flag, falling back to raw sidecars when canonical files are absent.
-
-### Stage 3.2
-
-Settle feature-space semantics and make all advanced dataloading methods work correctly, including HVG-aware and global-feature-aware paths where needed.  Loaders read canonical var metadata directly, using `canonical_gene_id` for global-feature-space sampling.
-
-## Final Design Intent
-
-`perturb-data-lab` should become easy to explain again.
-
-The intended sentence is:
-
-"Inspect a dataset to approve its count source, materialize it into a backend while preserving raw metadata and feature truth, register it in a corpus ledger, canonicalize metadata via human-authored transform schemas, and then load it through simple or advanced dataloaders that read canonical files directly — depending on whether only local feature space or full canonicalized global feature space is required."
-
-If later implementation plans do not reinforce that sentence, they are pushing the repository away from this design.
+- Materialization preserves sparse counts and raw metadata; it does not solve cross-dataset metadata harmonization.
+- Canonicalization adds reviewed metadata; it does not mutate materialized expression rows.
+- The loader requires canonical metadata; it does not infer a final schema from raw sidecars.
+- Feature identity is dataset-local at materialization time and corpus-global at load time.
+- Current mainline docs describe Lance/Zarr only.

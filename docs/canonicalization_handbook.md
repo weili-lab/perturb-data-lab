@@ -1,126 +1,169 @@
 # Canonicalization Handbook
 
-## Purpose
+Canonicalization turns materialized raw metadata sidecars into loader-ready
+canonical obs and var parquet files. It is the main manual review step in the
+repo because every perturb-seq source uses different metadata fields.
 
-This handbook explains the current canonicalization path in `perturb-data-lab`:
+## Where Canonicalization Fits
 
 ```text
 inspect
-→ materialize
-→ draft-schema
-→ finalize final-schema.yaml
-→ canonicalize
-→ load_corpus
+  -> materialize
+  -> draft-schema
+  -> review and write final-schema.yaml
+  -> canonicalize
+  -> load_corpus()
 ```
 
-Use it when you need to review `draft-schema.yaml`, write `final-schema.yaml`, understand how canonical obs/var files are produced, or reason about how loader gene IDs become runtime token IDs.
+Materialization preserves raw source truth. Canonicalization adds a reviewed,
+consistent view used by runtime loaders. It does not rewrite the sparse count
+matrix.
 
-## What canonicalization reads and writes
+## Inputs and Outputs
 
-Canonicalization is dataset-local and runs after materialization.
+For each dataset, canonicalization reads:
 
-For each dataset, it reads:
-
-- `meta/<dataset_id>/dataset-summary.yaml`
-- `meta/<dataset_id>/raw-obs.parquet`
-- `meta/<dataset_id>/raw-var.parquet`
-- `meta/<dataset_id>/size-factor.parquet` when present
-- `meta/<dataset_id>/final-schema.yaml`
+- `dataset-summary.yaml`
+- `materialization-manifest.yaml`
+- `raw-obs.parquet`
+- `raw-var.parquet`
+- `size-factor.parquet` when present
+- `final-schema.yaml`
 
 It writes:
 
-- `meta/<dataset_id>/canonical_meta/canonical-obs.parquet`
-- `meta/<dataset_id>/canonical_meta/canonical-var.parquet`
+- `canonical_meta/canonical-obs.parquet`
+- `canonical_meta/canonical-var.parquet`
 
-Current CLI behavior:
+`canonicalize` does not write a corpus-level vocabulary YAML as part of the
+public CLI path. Runtime feature alignment is reconstructed by `load_corpus()`
+from `canonical-var.parquet` files.
 
-- `draft-schema` writes `draft-schema.yaml`
-- `canonicalize` only discovers `final-schema.yaml`
-- `canonicalize` no longer writes `corpus-vocab.yaml`
+## Paths by Topology
 
-## Data flow at a glance
+Aggregate topology:
 
-1. `inspect` profiles metadata, count-source candidates, sampled values, and likely control labels.
-2. `materialize` writes raw sidecars under `meta/<dataset_id>/`.
-3. `draft-schema` converts those sidecars plus inspection hints into a reviewable `draft-schema.yaml`.
-4. A human or agent reviews the draft and saves the approved mapping as `final-schema.yaml`.
-5. `canonicalize` applies the approved mappings and ordered transforms to raw obs/var data.
-6. `load_corpus()` consumes canonical metadata and reconstructs corpus-level gene IDs from `canonical_gene_id` values, optionally anchored by `gene-tokenizer.json`.
+```text
+corpus/
+└── meta/
+    └── <dataset_id>/
+        ├── raw-obs.parquet
+        ├── raw-var.parquet
+        ├── size-factor.parquet
+        ├── draft-schema.yaml
+        ├── final-schema.yaml
+        └── canonical_meta/
+            ├── canonical-obs.parquet
+            └── canonical-var.parquet
+```
 
-## Raw sidecars versus canonical outputs
+Federated topology:
 
-Raw sidecars are provenance-preserving inputs. They should answer: “what did the source dataset actually contain?”
+```text
+corpus/
+└── <dataset_id>/
+    └── meta/
+        ├── raw-obs.parquet
+        ├── raw-var.parquet
+        ├── size-factor.parquet
+        ├── draft-schema.yaml
+        ├── final-schema.yaml
+        └── canonical_meta/
+            ├── canonical-obs.parquet
+            └── canonical-var.parquet
+```
 
-- `raw-obs.parquet`: raw cell metadata surface used for canonical obs mapping
-- `raw-var.parquet`: raw feature metadata surface used for canonical var mapping
-- `size-factor.parquet`: optional numeric sidecar for `size_factor`
+The CLI resolves these paths from `corpus-index.yaml`, so most users only pass
+the corpus root.
 
-Canonical outputs are normalized views used by runtime loaders.
+## CLI Workflow
 
-- `canonical-obs.parquet`: required canonical cell metadata columns plus optional extensible columns
-- `canonical-var.parquet`: required canonical feature identity columns plus optional extensible columns
+Draft schemas after materialization:
 
-Keep high-cardinality or ambiguous fields raw-only unless there is a clear downstream need to canonicalize them.
+```bash
+PYTHONPATH=src python -m perturb_data_lab.cli draft-schema \
+  --corpus /path/to/corpus
+```
 
-## `draft-schema.yaml` versus `final-schema.yaml`
+This writes one `draft-schema.yaml` per uncanonicalized dataset. Existing drafts
+are skipped unless `--force-all` is used.
 
-`draft-schema.yaml` is heuristic and review-oriented.
+Review each draft and save the approved version as `final-schema.yaml` in the
+same dataset metadata directory.
 
-- it may suggest transforms from sampled values
-- it may suggest `coalesce` for complementary perturbation columns
-- it may include conservative notes about uncertainty or review-needed decisions
-- it should not be treated as automatically safe for production canonicalization
+Dry-run canonicalization:
 
-`final-schema.yaml` is the reviewed contract that `canonicalize` executes.
+```bash
+PYTHONPATH=src python -m perturb_data_lab.cli canonicalize \
+  --corpus /path/to/corpus \
+  --dry-run
+```
 
-- use the same schema structure
-- keep only mappings you actually approve
-- set `status: ready` as the review marker
-- prefer the smallest faithful mapping over speculative cleanup
+Canonicalize all datasets that have `final-schema.yaml`:
 
-Minimal example:
+```bash
+PYTHONPATH=src python -m perturb_data_lab.cli canonicalize \
+  --corpus /path/to/corpus
+```
+
+Canonicalize one dataset:
+
+```bash
+PYTHONPATH=src python -m perturb_data_lab.cli canonicalize \
+  --corpus /path/to/corpus \
+  --dataset-id my_dataset
+```
+
+Bulk canonicalization continues past failures and reports all failed datasets at
+the end.
+
+## Draft Schema Versus Final Schema
+
+`draft-schema.yaml` is heuristic. It uses inspection profiles and raw sidecar
+field names to produce a starting point.
+
+`final-schema.yaml` is the reviewed schema executed by `canonicalize`.
+
+Recommended review rule: keep the smallest faithful mapping that represents the
+dataset. Do not promote high-cardinality or ambiguous raw fields unless a
+downstream workflow needs them.
+
+Set `status: ready` in reviewed schemas for human clarity. The current schema
+loader accepts both `draft` and `ready`, but the filename `final-schema.yaml` is
+what the CLI discovers.
+
+## Schema Structure
+
+Minimal shape:
 
 ```yaml
 kind: canonicalization-schema
 contract_version: 0.3.0
-dataset_id: replogle_like
+dataset_id: my_dataset
 status: ready
+description: Reviewed canonicalization schema for my_dataset.
+
 gene_mapping:
   enabled: false
   engine: identity
-obs_column_mappings:
-  - canonical_name: perturb_label
-    strategy: coalesce
-    source_columns: [perturbation, target_gene]
-    transforms:
-      - name: strip_whitespace
-        args: {}
-      - name: strip_guide_suffix
-        args: {}
-      - name: map_control_labels
-        args:
-          candidates: [NTC, non-targeting]
-          output: ctrl
-var_column_mappings:
-  - canonical_name: origin_index
-    strategy: passthrough
-  - canonical_name: gene_id
-    strategy: source-field
-    source_column: feature_id
-    transforms:
-      - name: strip_ensembl_version
-        args: {}
-  - canonical_name: canonical_gene_id
-    strategy: gene-mapping
-    enabled: false
-    engine: identity
-  - canonical_name: global_id
-    strategy: auto
+  source_namespace: gene_symbol
+  target_namespace: gene_symbol
+  mapping_file: null
+
+obs_column_mappings: []
+obs_extensible: []
+var_column_mappings: []
+var_extensible: []
+notes: []
 ```
 
-## Required canonical fields
+The runner validates duplicate canonical names across normal mappings and
+extensible columns. It also requires all required canonical obs and var fields
+to be produced.
 
-### Required obs fields
+## Required Canonical Obs Fields
+
+Every `canonical-obs.parquet` must contain:
 
 - `assay`
 - `batch_id`
@@ -145,35 +188,75 @@ var_column_mappings:
 - `timepoint_unit`
 - `tissue`
 
-### Required var fields
+Typed obs fields:
+
+- `global_row_index`: int64
+- `dataset_index`: int32
+- `local_row_index`: int64
+- `size_factor`: float64
+
+Nullable string obs fields:
+
+- `dose`
+- `dose_unit`
+- `timepoint`
+- `timepoint_unit`
+
+All other required obs fields are written as strings. Missing string values use
+the mapping fallback, usually `NA`.
+
+## Required Canonical Var Fields
+
+Every `canonical-var.parquet` must contain:
 
 - `origin_index`
 - `gene_id`
 - `canonical_gene_id`
 - `global_id`
 
-Notes:
+Meanings:
 
-- `size_factor` comes from `size-factor.parquet` when present and otherwise defaults to `1.0`.
-- `row-index` currently emits zero-based row order for the dataset sidecars.
-- `canonical_gene_id` is the harmonized gene identifier that runtime loading actually uses.
+- `origin_index`: dataset-local feature order from the materialized count matrix
+- `gene_id`: source gene/feature identifier used as the input to gene mapping
+- `canonical_gene_id`: harmonized identifier used for corpus-level feature alignment
+- `global_id`: deterministic per-dataset field written during canonicalization
 
-## Obs mapping strategies
+Runtime loaders do not trust `global_id` as the corpus-global feature contract.
+`FeatureRegistry` rebuilds corpus-global feature IDs from `canonical_gene_id`.
 
-The current runner supports these obs mapping strategies:
+## Raw Sidecar Loading
+
+`raw-obs.parquet` stores stable top-level fields plus a JSON `raw_fields` column.
+During canonicalization, the runner expands `raw_fields` so schema mappings can
+refer to the original obs columns by name.
+
+`raw-var.parquet` stores `origin_index`, `feature_id`, and JSON `raw_var`. The
+runner expands `raw_var` so schema mappings can refer to original var columns by
+name.
+
+`size-factor.parquet` is aligned by `cell_id` when needed. If no size-factor file
+is present, `size_factor` defaults to `1.0`.
+
+## Obs Mapping Strategies
 
 ### `source-field`
 
-Read one raw column, then run ordered transforms.
+Read one raw obs column and apply transforms.
 
 ```yaml
-- canonical_name: sex
+- canonical_name: cell_line_or_type
   strategy: source-field
-  source_column: donor_sex
+  source_column: cell_type
   transforms:
-    - name: normalize_case
-      args: {mode: lower}
+    - name: strip_whitespace
+      args: {}
 ```
+
+If the source column is missing, the runner fills the field with `fallback` and
+records a warning.
+
+Special case: `size_factor` with `source-field` reads from the size-factor vector
+rather than raw obs.
 
 ### `literal`
 
@@ -185,91 +268,200 @@ Fill one constant value for every row.
   literal_value: human
 ```
 
-### `null`
+### `passthrough`
 
-Fill the mapping fallback, usually `NA` or another explicit placeholder.
+Copy a raw column. The runner first looks for a raw column named the same as the
+canonical field, then uses `source_column` if provided.
+
+```yaml
+- canonical_name: batch_id
+  strategy: passthrough
+  source_column: batch
+```
+
+If no column is found, the field is filled with `fallback` and a warning is
+recorded.
 
 ### `row-index`
 
-Emit `0..n-1` in sidecar row order.
+Write zero-based row order for the materialized dataset.
+
+```yaml
+- canonical_name: local_row_index
+  strategy: row-index
+```
+
+Use this for `local_row_index`. `global_row_index` should usually come from the
+raw obs sidecar because materialization registered corpus-global row ranges.
+
+### `null`
+
+Fill every row with `fallback`.
+
+```yaml
+- canonical_name: disease_state
+  strategy: null
+  fallback: NA
+```
 
 ### `coalesce`
 
-Take the first non-null-like value from `source_columns`, then run transforms.
+Pick the first non-null-like value from ordered source columns, then apply
+transforms.
+
+```yaml
+- canonical_name: perturb_label
+  strategy: coalesce
+  source_columns: [perturbation, target_gene, guide_id]
+  transforms:
+    - name: strip_whitespace
+      args: {}
+    - name: strip_guide_suffix
+      args: {}
+    - name: map_control_labels
+      args:
+        candidates: [NTC, non-targeting]
+        output: ctrl
+```
+
+All listed source columns must exist.
 
 ### `join`
 
-Join multiple columns with `separator`, optionally skipping nulls.
+Join multiple source columns into one string.
+
+```yaml
+- canonical_name: condition
+  strategy: join
+  source_columns: [treatment, dose]
+  separator: "_"
+  skip_nulls: true
+```
+
+All listed source columns must exist.
 
 ### `template`
 
-Render a Python format template like `{cellline}:{treatment}:{time_raw}`.
+Render a Python-style format string from raw source columns.
+
+```yaml
+- canonical_name: condition
+  strategy: template
+  template: "{treatment}_{timepoint}h"
+  missing_value_behavior: fallback
+```
+
+Template fields are discovered from braces and must exist in raw obs.
 
 `missing_value_behavior` can be:
 
-- `fallback`
-- `empty`
-- `literal`
+- `fallback`: return the mapping fallback when any template field is null-like
+- `empty`: render missing fields as empty strings
+- `literal`: use `missing_value` for missing fields
 
 ### `conditional`
 
-Evaluate ordered cases, then optional default output.
+Evaluate ordered cases and use the first matching result.
 
-Predicates currently supported:
+```yaml
+- canonical_name: perturb_type
+  strategy: conditional
+  cases:
+    - source_column: is_control
+      predicate: equals
+      value: "true"
+      result_literal: control
+    - source_column: perturbation
+      predicate: not_null
+      result_literal: crispr
+  default_literal: unknown
+```
+
+Supported predicates:
 
 - `equals`
 - `in`
 - `not_null`
 
-## Var mapping strategies
+Each case must provide exactly one of `result_literal` or
+`result_source_column`. Defaults can use `default_literal` or
+`default_source_column`.
 
-The current runner supports these var strategies:
+## Var Mapping Strategies
 
-- `passthrough`
+The schema allows these var strategies:
+
 - `source-field`
 - `literal`
-- `null`
+- `passthrough`
 - `gene-mapping`
 - `auto`
+- `null`
 
-Typical usage:
+The current runner has special handling for the four required var fields by
+canonical name:
 
-- `origin_index`: `passthrough`
-- `gene_id`: `source-field`
-- `canonical_gene_id`: `gene-mapping`
-- `global_id`: `auto`
+- `origin_index`: read from raw var `origin_index` or the configured source column
+- `gene_id`: read from the configured `source_column` or raw `gene_id`
+- `canonical_gene_id`: produced from `gene_id` through the top-level `gene_mapping` block
+- `global_id`: assigned deterministically within the dataset from sorted canonical gene IDs
 
-`global_id` is generated deterministically from canonical gene IDs during canonicalization, but loader tokenization is rebuilt from `canonical_gene_id` values rather than trusting that field as the corpus-global runtime contract.
-
-## Transform execution order
-
-Transforms run after the mapping strategy resolves a value.
-
-- `source-field`: transforms apply to the extracted raw value
-- `coalesce`, `join`, `template`, `conditional`: transforms apply to the derived output value
-- transforms run in the order listed in YAML
-- if a transform name is unknown to the runtime dispatcher, it is warned and skipped
-- if a transform raises an exception or ends in a null-like value, the mapping falls back to its `fallback`
-
-Practical rule: put cleanup transforms before harmonization transforms.
-
-Good pattern for perturb labels:
+Practical required-var block:
 
 ```yaml
-transforms:
-  - name: strip_whitespace
-    args: {}
-  - name: strip_guide_suffix
-    args: {}
-  - name: map_control_labels
-    args:
-      candidates: [NTC, non-targeting]
-      output: ctrl
+var_column_mappings:
+  - canonical_name: origin_index
+    strategy: passthrough
+  - canonical_name: gene_id
+    strategy: source-field
+    source_column: feature_id
+  - canonical_name: canonical_gene_id
+    strategy: gene-mapping
+  - canonical_name: global_id
+    strategy: auto
 ```
 
-## Runtime-dispatched transforms
+Current caveat: transforms listed on the required `gene_id` mapping are not
+applied before gene mapping because the runner collects `gene_id` values before
+generic var transform handling. If exact gene cleanup is needed, provide a raw
+source column that is already in the desired form, use a mapping file, or
+preprocess the source metadata before materialization.
 
-These transform names are currently wired through the canonicalization runner:
+## Extensible Columns
+
+Use `obs_extensible` or `var_extensible` to carry optional raw fields into
+canonical parquet files without making them part of the required schema.
+
+```yaml
+obs_extensible:
+  - raw_source_column: donor_age
+    canonical_name: donor_age
+
+var_extensible:
+  - raw_source_column: highly_variable
+    canonical_name: source_highly_variable
+```
+
+If an extensible raw source column is missing, the output column is filled with
+`NA` and a warning is recorded.
+
+## Transform Execution
+
+Transforms run after a mapping strategy resolves a value.
+
+For obs mappings:
+
+- `source-field`: transforms apply to the extracted value
+- `coalesce`: transforms apply to the selected value
+- `join`: transforms apply to the joined value
+- `template`: transforms apply to the rendered value
+- `conditional`: transforms apply to the selected case/default result
+
+Transforms run in YAML order. Unknown transform names are logged and skipped.
+If a transform raises an exception or the final value is null-like, the mapping
+uses its `fallback`.
+
+Runtime-dispatched transforms:
 
 - `map_control_labels`
 - `strip_whitespace`
@@ -283,192 +475,239 @@ These transform names are currently wired through the canonicalization runner:
 - `split_on_delimiter`
 - `dose_parse`
 - `dose_unit`
-- `normalize_dose_unit`
 - `timepoint_parse`
 - `timepoint_unit`
 - `normalize_time_unit`
+- `normalize_dose_unit`
 - `strip_ensembl_version`
 - `normalize_boolean`
 
-Important: some helper or legacy functions exist in `inspectors/transforms.py`, but only the names above are currently dispatched by `get_transform()` for schema execution.
-
-## Control-label review and the default `ctrl`
-
-Inspection now records `control_label_candidates` from likely metadata columns such as perturbation labels or explicit control flags.
-
-Drafting uses those hints conservatively:
-
-- high-confidence labels like `NTC` or `non-targeting` can trigger a suggested `map_control_labels`
-- ambiguous labels like `WT` stay review-only and should not be blindly collapsed to controls
-
-Recommended policy:
-
-- standardize to `ctrl` unless you have a corpus-wide reason not to
-- keep the configured `output` consistent across datasets in the same corpus
-- review candidate values in `dataset-summary.yaml` before approving the transform
-
-## Gene identifiers, `canonical_gene_id`, and `gene-tokenizer.json`
-
-### `gene_id` versus `canonical_gene_id`
-
-- `gene_id`: the raw or lightly cleaned source identifier from `raw-var.parquet`
-- `canonical_gene_id`: the harmonized identifier used for corpus-level runtime alignment
-
-The top-level `gene_mapping` block controls how `gene_id` becomes `canonical_gene_id`.
-
-Current engines:
-
-- `identity`
-- `mapping_file`
-- `gget`
-
-If drafting sees Ensembl-like IDs in samples, it may suggest identity-preserving cleanup such as `strip_ensembl_version` and can infer a non-identity mapping configuration when appropriate.
-
-### What `gene-tokenizer.json` means
-
-`gene-tokenizer.json` is the persisted corpus-level token contract for `canonical_gene_id` values.
-
-- token IDs are append-stable
-- dataset order comes from `corpus-index.yaml`, not alphabetical ordering
-- unseen genes are appended in each dataset's local `origin_index` order
-- the file records `dataset_build_order` and per-dataset token spans for auditability
-
-### How `load_corpus()` uses it
-
-At load time:
-
-1. `load_corpus()` discovers dataset order from `corpus-index.yaml`.
-2. If `gene-tokenizer.json` exists, it is loaded and its `dataset_build_order` must match the corpus index order.
-3. If the tokenizer file is absent, the loader deterministically rebuilds the same mapping from each dataset's `canonical-var.parquet` in corpus order.
-4. `FeatureRegistry` then maps per-dataset local `origin_index` values onto corpus-global token IDs using `canonical_gene_id`.
-
-Current limitation: canonicalization itself does not automatically emit `gene-tokenizer.json`; the runtime can reconstruct it when absent.
-
-## Worked examples
-
-### Replogle-like perturb labels
-
-Use `coalesce` when one column holds control labels while another holds target genes.
+Practical ordering: clean first, then harmonize.
 
 ```yaml
-- canonical_name: perturb_label
-  strategy: coalesce
-  source_columns: [perturbation, target_gene, guide_id]
-  transforms:
-    - name: strip_whitespace
-      args: {}
-    - name: strip_guide_suffix
-      args: {}
-    - name: map_control_labels
-      args:
-        candidates: [NTC]
-        output: ctrl
+transforms:
+  - name: strip_whitespace
+    args: {}
+  - name: strip_guide_suffix
+    args: {}
+  - name: map_control_labels
+    args:
+      candidates: [NTC, non-targeting]
+      output: ctrl
 ```
 
-### Sex or species normalization
+## Gene Mapping
+
+The top-level `gene_mapping` block controls how `gene_id` becomes
+`canonical_gene_id`.
+
+Supported engines:
+
+- `identity`: `canonical_gene_id = gene_id`
+- `mapping_file`: tab-separated mapping file, first column raw gene ID, second column canonical gene ID
+- `gget`: `gget.convert(...)` when `gget` is installed
+
+Identity example:
 
 ```yaml
-- canonical_name: species
-  strategy: source-field
-  source_column: organism
-  transforms:
-    - name: map_values
-      args:
-        mapping:
-          Homo sapiens: human
-          Mus musculus: mouse
+gene_mapping:
+  enabled: false
+  engine: identity
+  source_namespace: gene_symbol
+  target_namespace: gene_symbol
+  mapping_file: null
 ```
 
-### Dose and time parsing
+Mapping-file example:
 
 ```yaml
-- canonical_name: dose
-  strategy: source-field
-  source_column: treatment_dose
-  transforms:
-    - name: dose_parse
-      args: {}
-
-- canonical_name: dose_unit
-  strategy: source-field
-  source_column: treatment_dose
-  transforms:
-    - name: dose_unit
-      args: {}
-
-- canonical_name: timepoint
-  strategy: source-field
-  source_column: time_raw
-  transforms:
-    - name: timepoint_parse
-      args: {}
-
-- canonical_name: timepoint_unit
-  strategy: source-field
-  source_column: time_raw
-  transforms:
-    - name: timepoint_unit
-      args: {}
+gene_mapping:
+  enabled: true
+  engine: mapping_file
+  source_namespace: gene_symbol
+  target_namespace: ensembl_gene_id
+  mapping_file: ./artifacts/gene_symbol_to_ensembl.tsv
 ```
 
-### Ensembl version stripping
+If `gget` is unavailable or conversion fails, the current runner logs a warning
+and falls back to identity mapping.
+
+## Runtime Feature Alignment
+
+`load_corpus()` builds `FeatureRegistry` from every dataset's
+`canonical-var.parquet`.
+
+The registry:
+
+1. Reads datasets in `corpus-index.yaml` order.
+2. Casts `origin_index` to integer and sorts rows by `origin_index`.
+3. Requires `origin_index` to be contiguous `0..n_vars-1` after sorting.
+4. Walks `canonical_gene_id` values in local feature order.
+5. Assigns the next corpus-global feature ID when a `canonical_gene_id` is first seen.
+6. Builds each dataset's local-feature-index to global-feature-ID mapping.
+
+This means `origin_index` and `canonical_gene_id` are the two var fields that
+most directly affect runtime feature correctness.
+
+## Review Checklist
+
+Before copying a draft to `final-schema.yaml`, check:
+
+- `dataset_id` matches the corpus dataset ID exactly.
+- Every required obs field has one mapping.
+- Every required var field has one mapping.
+- No canonical field appears both in mappings and extensible columns.
+- `perturb_label` values make biological sense.
+- Control labels are mapped consistently across datasets.
+- `perturb_type` separates controls from treated cells when possible.
+- `cell_context`, `cell_line_or_type`, `assay`, `species`, and `tissue` are not guessed beyond source evidence.
+- `dose`, `dose_unit`, `timepoint`, and `timepoint_unit` are null when unavailable rather than invented.
+- `gene_id` source matches the matrix feature order.
+- `canonical_gene_id` namespace is consistent across datasets intended to share a feature vocabulary.
+- Optional high-cardinality fields are kept as extensible fields only when needed.
+
+## Worked Minimal Schema
 
 ```yaml
-- canonical_name: gene_id
-  strategy: source-field
-  source_column: feature_id
-  transforms:
-    - name: strip_ensembl_version
-      args: {}
+kind: canonicalization-schema
+contract_version: 0.3.0
+dataset_id: my_dataset
+status: ready
+description: Minimal reviewed schema.
+
+gene_mapping:
+  enabled: false
+  engine: identity
+  source_namespace: gene_symbol
+  target_namespace: gene_symbol
+  mapping_file: null
+
+obs_column_mappings:
+  - canonical_name: assay
+    strategy: literal
+    literal_value: Perturb-seq
+  - canonical_name: batch_id
+    strategy: source-field
+    source_column: batch
+  - canonical_name: cell_context
+    strategy: source-field
+    source_column: cell_type
+  - canonical_name: cell_id
+    strategy: passthrough
+  - canonical_name: cell_line_or_type
+    strategy: source-field
+    source_column: cell_type
+  - canonical_name: condition
+    strategy: null
+  - canonical_name: dataset_id
+    strategy: passthrough
+  - canonical_name: dataset_index
+    strategy: source-field
+    source_column: dataset_index
+  - canonical_name: disease_state
+    strategy: null
+  - canonical_name: donor_id
+    strategy: null
+  - canonical_name: dose
+    strategy: null
+  - canonical_name: dose_unit
+    strategy: null
+  - canonical_name: global_row_index
+    strategy: source-field
+    source_column: global_row_index
+  - canonical_name: local_row_index
+    strategy: source-field
+    source_column: local_row_index
+  - canonical_name: perturb_label
+    strategy: coalesce
+    source_columns: [perturbation, target_gene]
+    transforms:
+      - name: strip_whitespace
+        args: {}
+      - name: strip_guide_suffix
+        args: {}
+      - name: map_control_labels
+        args:
+          candidates: [NTC, non-targeting]
+          output: ctrl
+  - canonical_name: perturb_type
+    strategy: conditional
+    cases:
+      - source_column: perturbation
+        predicate: in
+        values: [NTC, non-targeting]
+        result_literal: control
+      - source_column: perturbation
+        predicate: not_null
+        result_literal: crispr
+    default_literal: unknown
+  - canonical_name: sex
+    strategy: null
+  - canonical_name: size_factor
+    strategy: source-field
+    source_column: size_factor
+  - canonical_name: species
+    strategy: literal
+    literal_value: human
+  - canonical_name: timepoint
+    strategy: null
+  - canonical_name: timepoint_unit
+    strategy: null
+  - canonical_name: tissue
+    strategy: null
+
+obs_extensible: []
+
+var_column_mappings:
+  - canonical_name: origin_index
+    strategy: passthrough
+  - canonical_name: gene_id
+    strategy: source-field
+    source_column: feature_id
+  - canonical_name: canonical_gene_id
+    strategy: gene-mapping
+  - canonical_name: global_id
+    strategy: auto
+
+var_extensible: []
+notes: []
 ```
 
-### Combinatorial perturbations
+## Common Failure Modes
 
-```yaml
-- canonical_name: condition
-  strategy: join
-  source_columns: [guide_1, guide_2]
-  separator: "+"
-  skip_nulls: true
-```
+Missing required canonical obs fields:
 
-Use `join` when both fields should survive. Use `coalesce` when only the first non-null field should win.
+- Add mappings for every field listed in the required obs section.
 
-## Common failure modes
+Missing required canonical var fields:
 
-### Duplicate canonical names
+- Add `origin_index`, `gene_id`, `canonical_gene_id`, and `global_id` mappings.
 
-Schema validation rejects duplicate canonical output names across required and extensible columns.
+Duplicate canonical names:
 
-### Wrong raw field selected
+- Remove duplicate mappings or duplicate extensible entries.
 
-`draft-schema` is heuristic. Always compare the chosen `source_column` against sampled examples from `dataset-summary.yaml`.
+Missing raw columns:
 
-### Over-aggressive control mapping
+- Check `raw-obs.parquet`, `raw-var.parquet`, and `dataset-summary.yaml` for actual field names.
+- `coalesce`, `join`, `template`, and `conditional` fail when referenced source columns are missing.
 
-Do not collapse ambiguous labels like `WT` to `ctrl` without dataset-specific evidence.
+Bad `origin_index` at load time:
 
-### High-cardinality metadata
+- `FeatureRegistry` requires numeric, contiguous `origin_index` after sorting.
+- If this fails, check `canonical-var.parquet` and the var mapping for `origin_index`.
 
-Do not promote large free-text or near-unique columns into canonical vocab-driving fields unless they are truly part of the runtime contract.
+Wrong controls:
 
-### Unstable gene or token IDs
+- Review `control_label_candidates` in `dataset-summary.yaml`.
+- Make sure `map_control_labels` candidates match raw values exactly enough for the configured case sensitivity.
 
-Do not reorder datasets during append and do not replace an existing persisted tokenizer with a differently ordered one.
+Wrong gene namespace:
 
-### Missing source columns
+- Confirm whether `gene_id` is a symbol, Ensembl ID, guide ID, or other feature ID.
+- Keep `canonical_gene_id` consistent across datasets that should share model tokens.
 
-`coalesce`, `join`, `template`, and `conditional` require all referenced source columns to exist. Missing columns raise actionable errors; fix the schema instead of weakening the mapping.
+Loader cannot find canonical parquet files:
 
-## Safe schema-finalization checklist
-
-- Confirm every required canonical obs/var field is present.
-- Review every heuristic note in `draft-schema.yaml` before copying it into `final-schema.yaml`.
-- Check control-label candidates against sampled values, not just column names.
-- Keep transform order intentional: cleanup first, harmonization second.
-- Prefer `coalesce` over manual literals when complementary raw columns exist.
-- Use `join` only when the combined string is the desired canonical value.
-- Keep Ensembl cleanup and gene mapping decisions explicit.
-- Make sure file names in your workflow are `draft-schema.yaml`, `final-schema.yaml`, `canonical-obs.parquet`, and `canonical-var.parquet`.
-- Do not expect `canonicalize` to write `corpus-vocab.yaml`.
-- If you rely on stable corpus-global gene IDs across appends, preserve or regenerate `gene-tokenizer.json` from canonical vars in corpus order.
+- Run `canonicalize` after writing `final-schema.yaml`.
+- Check topology-specific paths under `meta/<dataset_id>/canonical_meta` or `<dataset_id>/meta/canonical_meta`.
