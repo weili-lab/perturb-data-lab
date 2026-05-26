@@ -270,3 +270,18 @@ class TestSlimReaderFlatContract:
     def test_removed_backends_raise_clear_error(self, backend: str) -> None:
         with pytest.raises(ValueError, match="Unknown backend"):
             build_expression_reader(backend, "federated", [DatasetEntry("dummy", 0, 1)])
+
+
+def test_federated_zarr_open_arrays_recovers_partial_cache(fed_zarr_reader) -> None:
+    entry = fed_zarr_reader._find_entry_by_id("dummy_00")
+    assert isinstance(entry, ZarrDatasetEntry)
+
+    fed_zarr_reader._offsets_cache["dummy_00"] = fed_zarr_reader._open_arrays(entry)[0]
+    fed_zarr_reader._indices_cache.pop("dummy_00", None)
+    fed_zarr_reader._counts_cache.pop("dummy_00", None)
+
+    offsets, indices_arr, counts_arr = fed_zarr_reader._open_arrays(entry)
+
+    assert offsets is fed_zarr_reader._offsets_cache["dummy_00"]
+    assert indices_arr is fed_zarr_reader._indices_cache["dummy_00"]
+    assert counts_arr is fed_zarr_reader._counts_cache["dummy_00"]

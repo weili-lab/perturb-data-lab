@@ -9,13 +9,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 import numpy as np
+import polars as pl
 import yaml
 
 from .expression import (
     DatasetEntry,
+    ExpressionBatch,
     ExpressionReader,
     LanceDatasetEntry,
     ZarrDatasetEntry,
@@ -65,6 +67,13 @@ class Corpus:
     topology: str = ""
     backend: str = ""
     corpus_root: Path = Path()
+    canonical_obs_paths: dict[str, Path] = field(default_factory=dict)
+    canonical_var_paths: dict[str, Path] = field(default_factory=dict)
+
+    @property
+    def dataset_ids(self) -> tuple[str, ...]:
+        """Dataset IDs in corpus routing order."""
+        return tuple(entry.dataset_id for entry in self.dataset_entries)
 
     def take_metadata(
         self,
@@ -80,6 +89,72 @@ class Corpus:
         normalized_indices = _normalize_batch_indices(indices)
         resolved_columns = _normalize_take_columns(self.metadata_index, columns)
         return self.metadata_index.take(normalized_indices, resolved_columns)
+
+    def to_anndata(
+        self,
+        *,
+        dataset_id: str | Sequence[str],
+        obs_columns: Sequence[str] | None = None,
+    ):
+        """Export whole selected dataset(s) as an in-memory AnnData object.
+
+        The selected datasets must share the same ordered ``canonical_gene_id``
+        axis. Arbitrary row subsets are intentionally not supported; any subset
+        or feature remapping should happen after the AnnData object exists.
+        """
+        import anndata as ad
+
+        selected = _normalize_dataset_selection(dataset_id)
+        var_df = _load_shared_var(self, selected)
+        obs = _build_obs_dataframe(self, selected, obs_columns=obs_columns)
+        global_indices = _selected_dataset_global_indices(self, selected)
+        batch = self.expression_reader.read_expression_flat(global_indices.tolist())
+        x = _expression_batch_to_csr(batch, n_vars=var_df.height)
+        return ad.AnnData(X=x, obs=obs, var=_var_dataframe_to_pandas(var_df))
+
+    def to_anndata_lazy(
+        self,
+        *,
+        dataset_id: str | Sequence[str],
+        obs_columns: Sequence[str] | None = None,
+        chunk_rows: int = 4096,
+    ):
+        """Export whole selected dataset(s) as AnnData with Dask-backed ``X``.
+
+        Only ``X`` is lazy. Observation and feature metadata are loaded in
+        memory because they are small compared with the count matrix.
+        """
+        import anndata as ad
+
+        if int(chunk_rows) <= 0:
+            raise ValueError("chunk_rows must be positive")
+        selected = _normalize_dataset_selection(dataset_id)
+        var_df = _load_shared_var(self, selected)
+        obs = _build_obs_dataframe(self, selected, obs_columns=obs_columns)
+        x = _build_lazy_expression_matrix(
+            self,
+            selected,
+            n_vars=var_df.height,
+            chunk_rows=int(chunk_rows),
+        )
+        return ad.AnnData(X=x, obs=obs, var=_var_dataframe_to_pandas(var_df))
+
+    def add_obs_meta(
+        self,
+        frame: Any,
+        *,
+        on: Sequence[str],
+    ) -> None:
+        """Join additional observation metadata into this loaded corpus.
+
+        This is runtime-only. The incoming frame must cover every corpus row
+        exactly once using explicit join keys.
+        """
+        self.metadata_index.df = _join_obs_metadata(
+            self.metadata_index.df,
+            frame,
+            on=on,
+        )
 
 # ---------------------------------------------------------------------------
 # Backend name normalisation
@@ -259,6 +334,235 @@ def _normalize_batch_indices(
 
 
 # ---------------------------------------------------------------------------
+# AnnData and runtime metadata helpers
+# ---------------------------------------------------------------------------
+
+
+def _normalize_dataset_selection(dataset_id: str | Sequence[str]) -> tuple[str, ...]:
+    if isinstance(dataset_id, str):
+        return (dataset_id,)
+    return tuple(dataset_id)
+
+
+def _entry_map(corpus: Corpus) -> dict[str, DatasetEntry]:
+    return {entry.dataset_id: entry for entry in corpus.dataset_entries}
+
+
+def _selected_dataset_global_indices(
+    corpus: Corpus,
+    dataset_ids: Sequence[str],
+) -> np.ndarray:
+    entries = _entry_map(corpus)
+    parts = [
+        np.arange(entries[ds_id].global_start, entries[ds_id].global_end, dtype=np.int64)
+        for ds_id in dataset_ids
+    ]
+    return np.concatenate(parts)
+
+
+def _load_sorted_var_frame(corpus: Corpus, dataset_id: str) -> pl.DataFrame:
+    var_df = pl.read_parquet(str(corpus.canonical_var_paths[dataset_id]))
+    return var_df.with_columns(
+        pl.col("origin_index").cast(pl.Int64, strict=True).alias("origin_index"),
+        pl.col("canonical_gene_id").cast(pl.Utf8, strict=True).alias("canonical_gene_id"),
+    ).sort("origin_index")
+
+
+def _load_shared_var(
+    corpus: Corpus,
+    dataset_ids: Sequence[str],
+) -> pl.DataFrame:
+    first_id = dataset_ids[0]
+    first_var = _load_sorted_var_frame(corpus, first_id)
+    first_axis = first_var["canonical_gene_id"].to_list()
+    for ds_id in dataset_ids[1:]:
+        other_var = _load_sorted_var_frame(corpus, ds_id)
+        other_axis = other_var["canonical_gene_id"].to_list()
+        if other_axis != first_axis:
+            raise ValueError(
+                "selected datasets do not share the same ordered canonical_gene_id axis: "
+                f"{first_id!r} vs {ds_id!r}"
+            )
+    return first_var
+
+
+def _resolve_obs_columns(
+    corpus: Corpus,
+    obs_columns: Sequence[str] | None,
+) -> tuple[str, ...]:
+    if obs_columns is None:
+        return tuple(corpus.metadata_index.df.columns)
+    required = ("global_row_index", "dataset_id", "dataset_index", "local_row_index", "cell_id")
+    return tuple(dict.fromkeys((*required, *obs_columns)))
+
+
+def _build_obs_dataframe(
+    corpus: Corpus,
+    dataset_ids: Sequence[str],
+    *,
+    obs_columns: Sequence[str] | None,
+):
+    import pandas as pd
+
+    columns = _resolve_obs_columns(corpus, obs_columns)
+    entries = _entry_map(corpus)
+    frames = []
+    for ds_id in dataset_ids:
+        entry = entries[ds_id]
+        indices = np.arange(entry.global_start, entry.global_end, dtype=np.int64)
+        frames.append(pd.DataFrame(corpus.take_metadata(indices, columns=columns)))
+    obs = pd.concat(frames, ignore_index=True)
+    obs.index = obs["global_row_index"].astype(str)
+    obs.index.name = None
+    return obs
+
+
+def _var_dataframe_to_pandas(var_df: pl.DataFrame):
+    var = var_df.to_pandas()
+    var.index = var["canonical_gene_id"].astype(str)
+    var.index.name = None
+    return var
+
+
+def _expression_batch_to_csr(batch: ExpressionBatch, *, n_vars: int):
+    from scipy import sparse
+
+    return sparse.csr_matrix(
+        (
+            batch.expression_counts,
+            batch.expressed_gene_indices,
+            batch.row_offsets,
+        ),
+        shape=(batch.batch_size, int(n_vars)),
+        dtype=np.int32,
+    )
+
+
+def _read_expression_csr_block(
+    reader: ExpressionReader,
+    start: int,
+    stop: int,
+    n_vars: int,
+):
+    indices = list(range(int(start), int(stop)))
+    batch = reader.read_expression_flat(indices)
+    return _expression_batch_to_csr(batch, n_vars=n_vars)
+
+
+def _build_lazy_expression_matrix(
+    corpus: Corpus,
+    dataset_ids: Sequence[str],
+    *,
+    n_vars: int,
+    chunk_rows: int,
+):
+    import dask.array as da
+    from dask import delayed
+    from scipy import sparse
+
+    entries = _entry_map(corpus)
+    blocks = []
+    meta = sparse.csr_matrix((0, 0), dtype=np.int32)
+    for ds_id in dataset_ids:
+        entry = entries[ds_id]
+        for start in range(entry.global_start, entry.global_end, int(chunk_rows)):
+            stop = min(start + int(chunk_rows), entry.global_end)
+            task = delayed(_read_expression_csr_block)(
+                corpus.expression_reader,
+                start,
+                stop,
+                int(n_vars),
+            )
+            blocks.append(
+                da.from_delayed(
+                    task,
+                    shape=(stop - start, int(n_vars)),
+                    dtype=np.int32,
+                    meta=meta,
+                )
+            )
+    return da.concatenate(blocks, axis=0)
+
+
+def _frame_to_polars(frame: Any) -> pl.DataFrame:
+    if isinstance(frame, pl.DataFrame):
+        return frame
+    try:
+        import pandas as pd
+
+        if isinstance(frame, pd.DataFrame):
+            return pl.from_pandas(frame)
+    except ImportError:
+        pass
+    return pl.DataFrame(frame)
+
+
+def _normalize_join_keys(on: Sequence[str]) -> tuple[str, ...]:
+    if isinstance(on, (str, bytes)):
+        raise TypeError("on must be a sequence of join-key column names")
+    keys = tuple(str(column) for column in on)
+    if not keys:
+        raise ValueError("on must contain at least one join key")
+    if len(set(keys)) != len(keys):
+        raise ValueError("on join keys must be unique")
+    if any(not key for key in keys):
+        raise ValueError("on join keys must be non-empty strings")
+    return keys
+
+
+def _has_duplicate_keys(df: pl.DataFrame, keys: Sequence[str]) -> bool:
+    return bool(df.select(list(keys)).is_duplicated().any())
+
+
+def _check_join_key_columns(df: pl.DataFrame, keys: Sequence[str], *, context: str) -> None:
+    missing = [key for key in keys if key not in df.columns]
+    if missing:
+        raise ValueError(f"{context} missing join key column(s): {missing}")
+    null_keys = [key for key in keys if int(df[key].null_count()) > 0]
+    if null_keys:
+        raise ValueError(f"{context} has null values in join key column(s): {null_keys}")
+
+
+def _join_obs_metadata(
+    corpus_df: pl.DataFrame,
+    frame: Any,
+    *,
+    on: Sequence[str],
+) -> pl.DataFrame:
+    keys = _normalize_join_keys(on)
+    incoming = _frame_to_polars(frame)
+    _check_join_key_columns(corpus_df, keys, context="corpus metadata")
+    _check_join_key_columns(incoming, keys, context="incoming metadata")
+
+    value_columns = [column for column in incoming.columns if column not in keys]
+    if not value_columns:
+        raise ValueError("incoming metadata must contain at least one non-key column")
+    collisions = [column for column in value_columns if column in corpus_df.columns]
+    if collisions:
+        raise ValueError(f"incoming metadata column(s) already exist in corpus: {collisions}")
+
+    if _has_duplicate_keys(corpus_df, keys):
+        raise ValueError("corpus metadata join keys are not unique")
+    if _has_duplicate_keys(incoming, keys):
+        raise ValueError("incoming metadata join keys are not unique")
+
+    corpus_keys = corpus_df.select(list(keys))
+    incoming_keys = incoming.select(list(keys))
+    missing_rows = corpus_keys.join(incoming_keys, on=list(keys), how="anti")
+    if missing_rows.height:
+        raise ValueError("incoming metadata does not cover every corpus row")
+    extra_rows = incoming_keys.join(corpus_keys, on=list(keys), how="anti")
+    if extra_rows.height:
+        raise ValueError("incoming metadata contains rows not present in corpus")
+
+    return corpus_df.join(
+        incoming.select(list(keys) + value_columns),
+        on=list(keys),
+        how="left",
+    )
+
+
+# ---------------------------------------------------------------------------
 # load_corpus factory
 # ---------------------------------------------------------------------------
 
@@ -394,4 +698,6 @@ def load_corpus(
         topology=topology,
         backend=backend,
         corpus_root=root,
+        canonical_obs_paths=canonical_obs_paths,
+        canonical_var_paths=canonical_var_paths,
     )

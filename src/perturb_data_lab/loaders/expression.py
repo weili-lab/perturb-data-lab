@@ -592,7 +592,11 @@ class FederatedZarrReader(BaseExpressionReader):
         import zarr
 
         ds_id = entry.dataset_id
-        if ds_id not in self._offsets_cache:
+        if (
+            ds_id not in self._offsets_cache
+            or ds_id not in self._indices_cache
+            or ds_id not in self._counts_cache
+        ):
             self._offsets_cache[ds_id] = zarr.open(
                 str(entry.offsets_path), mode="r"
             )["row_offsets"]

@@ -196,11 +196,15 @@ batches with configurable labels, control definitions, row pools, and pairing
 groups. See `docs/perttf_loader.md`.
 
 The AnnData/Scanpy/RAPIDS path uses `corpus.to_anndata(...)` for eager
-counts-only export of one dataset or a selected subset. After export,
-Scanpy/RAPIDS should own normalization, log transforms, PCA, neighbors, UMAP,
-clustering, plotting, and exploratory differential expression. Corpus-native
-`pp` helpers remain for durable HVG rankings, streamed stats, QA/debug checks,
-and bounded-memory fallbacks. See `docs/anndata_scanpy_handoff.md`.
+counts-only export of whole selected dataset(s), or `corpus.to_anndata_lazy(...)`
+for Dask-backed `X` over whole selected dataset(s). Multi-dataset handoff is
+allowed only when the selected datasets share the same ordered feature axis.
+After export, Scanpy/RAPIDS should own normalization, log transforms, PCA,
+neighbors, UMAP, clustering, plotting, and exploratory differential expression.
+Selected full-corpus cell-level results can be joined back into the loaded corpus
+with `corpus.add_obs_meta(...)`. Corpus-native `pp` helpers remain for durable
+HVG rankings, streamed stats, QA/debug checks, and bounded-memory fallbacks. See
+`docs/anndata_scanpy_handoff.md`.
 
 ## Corpus Management Helpers
 

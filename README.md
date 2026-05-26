@@ -163,7 +163,9 @@ Useful runtime methods:
 - `corpus.take_metadata(global_row_indices, columns=[...])`: read canonical metadata columns
 - `corpus.inspect_batch(global_row_indices, metadata_columns=[...])`: inspect expression plus metadata together
 - `corpus.loader(...)`: build an iterable sparse batch loader
-- `corpus.to_anndata(...)`: eager counts-only AnnData handoff for one dataset or subset
+- `corpus.to_anndata(...)`: eager counts-only AnnData handoff for whole selected dataset(s)
+- `corpus.to_anndata_lazy(...)`: Dask-backed AnnData handoff for whole selected dataset(s)
+- `corpus.add_obs_meta(...)`: runtime-only join of full-corpus observation metadata
 
 By default, `load_corpus()` loads core canonical metadata. Pass
 `extra_metadata_columns=[...]` when a downstream workflow needs additional

@@ -105,11 +105,37 @@ def _write_lance_rows(path: Path, rows: list[dict[str, Any]]) -> None:
     lance.write_dataset(table, str(path), mode="overwrite")
 
 
-def _write_corpus_index(root: Path, *, topology: str) -> None:
+def _write_zarr_rows(matrix_root: Path, rows: list[dict[str, Any]]) -> None:
+    import zarr
+
+    matrix_root.mkdir(parents=True, exist_ok=True)
+    row_offsets = [0]
+    indices: list[int] = []
+    counts: list[int] = []
+    for row in rows:
+        indices.extend(row["expressed_gene_indices"])
+        counts.extend(row["expression_counts"])
+        row_offsets.append(len(indices))
+
+    arrays = {
+        "aggregated-row-offsets.zarr": ("row_offsets", np.asarray(row_offsets, dtype=np.int64)),
+        "aggregated-indices.zarr": ("indices", np.asarray(indices, dtype=np.int32)),
+        "aggregated-counts.zarr": ("counts", np.asarray(counts, dtype=np.int32)),
+    }
+    for store_name, (array_name, values) in arrays.items():
+        group = zarr.open(str(matrix_root / store_name), mode="w")
+        if hasattr(group, "create_dataset"):
+            arr = group.create_dataset(array_name, shape=values.shape, dtype=values.dtype)
+        else:
+            arr = group.create_array(array_name, shape=values.shape, dtype=values.dtype)
+        arr[:] = values
+
+
+def _write_corpus_index(root: Path, *, topology: str, backend: str = "lance") -> None:
     doc = {
         "kind": "corpus-index",
         "contract_version": "0.3.0",
-        "global_metadata": {"backend": "lance", "topology": topology},
+        "global_metadata": {"backend": backend, "topology": topology},
         "datasets": [
             {
                 "dataset_id": item["dataset_id"],
@@ -150,6 +176,16 @@ def _build_aggregate_lance_corpus(root: Path) -> None:
     for item in DATASETS:
         rows.extend(_expression_rows(item["cell_count"], seed=100 + item["dataset_index"]))
     _write_lance_rows(root / "matrix" / "aggregated-cells.lance", rows)
+
+
+def _build_aggregate_zarr_corpus(root: Path) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    _write_corpus_index(root, topology="aggregate", backend="zarr")
+    _write_metadata(root, topology="aggregate")
+    rows: list[dict[str, Any]] = []
+    for item in DATASETS:
+        rows.extend(_expression_rows(item["cell_count"], seed=300 + item["dataset_index"]))
+    _write_zarr_rows(root / "matrix", rows)
 
 
 def _build_federated_lance_corpus(root: Path) -> None:
@@ -197,6 +233,75 @@ def test_load_corpus_builds_components_without_runtime_loader_state(tmp_path: Pa
     assert not hasattr(corpus, "read_expression")
     assert not hasattr(corpus, "set_sampler")
     assert not hasattr(corpus, "select_obs_indices")
+
+
+def test_to_anndata_exports_whole_dataset_as_csr(tmp_path: Path) -> None:
+    import scipy.sparse as sp
+
+    _build_aggregate_lance_corpus(tmp_path)
+    corpus = load_corpus(tmp_path)
+
+    adata = corpus.to_anndata(dataset_id="mock_00")
+
+    assert adata.shape == (4, N_GENES)
+    assert sp.isspmatrix_csr(adata.X)
+    assert set(adata.obs["dataset_id"]) == {"mock_00"}
+    assert adata.var["canonical_gene_id"].to_list() == [f"GENE{i:05d}" for i in range(N_GENES)]
+
+
+def test_to_anndata_multi_dataset_requires_matching_feature_axis(tmp_path: Path) -> None:
+    _build_aggregate_lance_corpus(tmp_path)
+    var_path = tmp_path / "meta" / "mock_01" / "canonical_meta" / "canonical-var.parquet"
+    var_df = pl.read_parquet(var_path).with_columns(
+        pl.Series("canonical_gene_id", [f"OTHER{i:05d}" for i in range(N_GENES)])
+    )
+    var_df.write_parquet(var_path)
+    corpus = load_corpus(tmp_path)
+
+    with pytest.raises(ValueError, match="same ordered canonical_gene_id"):
+        corpus.to_anndata(dataset_id=["mock_00", "mock_01"])
+
+
+@pytest.mark.parametrize("builder", [_build_aggregate_lance_corpus, _build_aggregate_zarr_corpus])
+def test_to_anndata_lazy_builds_dask_sparse_x(tmp_path: Path, builder) -> None:
+    import dask.array as da
+    import scipy.sparse as sp
+
+    builder(tmp_path)
+    corpus = load_corpus(tmp_path)
+
+    adata = corpus.to_anndata_lazy(dataset_id="mock_00", chunk_rows=2)
+
+    assert adata.shape == (4, N_GENES)
+    assert isinstance(adata.X, da.Array)
+    assert adata.X.chunks[0] == (2, 2)
+    computed = adata.X.compute()
+    assert sp.isspmatrix_csr(computed)
+    assert computed.shape == (4, N_GENES)
+
+
+def test_add_obs_meta_requires_full_corpus_coverage(tmp_path: Path) -> None:
+    _build_aggregate_lance_corpus(tmp_path)
+    corpus = load_corpus(tmp_path)
+    incoming = corpus.metadata_index.df.select(["dataset_id", "cell_id"]).with_columns(
+        pl.Series("leiden", [f"cluster_{idx % 2}" for idx in range(len(corpus.metadata_index))])
+    )
+
+    corpus.add_obs_meta(incoming, on=["dataset_id", "cell_id"])
+
+    assert "leiden" in corpus.metadata_index.df.columns
+    assert corpus.take_metadata([0], columns=["leiden"])["leiden"] == ("cluster_0",)
+
+
+def test_add_obs_meta_rejects_subset_metadata(tmp_path: Path) -> None:
+    _build_aggregate_lance_corpus(tmp_path)
+    corpus = load_corpus(tmp_path)
+    incoming = corpus.metadata_index.df.filter(pl.col("dataset_id") == "mock_00").select(
+        ["dataset_id", "cell_id"]
+    ).with_columns(pl.lit("cluster_0").alias("leiden"))
+
+    with pytest.raises(ValueError, match="cover every corpus row"):
+        corpus.add_obs_meta(incoming, on=["dataset_id", "cell_id"])
 
 
 def test_expression_reader_and_take_metadata_use_global_rows(tmp_path: Path) -> None:

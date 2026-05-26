@@ -1,146 +1,111 @@
 # AnnData, Scanpy, and RAPIDS handoff
 
-This document describes the intended boundary between `perturb-data-lab` and
-standard single-cell analysis tools.
+This document describes the boundary between `perturb-data-lab` and standard
+single-cell analysis tools.
 
 `perturb-data-lab` owns corpus materialization, canonical metadata, sparse count
 storage, feature alignment for loaders, durable per-dataset HVG rankings, and
-training/runtime access patterns. After a dataset or subset has been exported as
-`AnnData`, Scanpy or RAPIDS should own the usual analysis preprocessing steps.
+training/runtime access patterns. After whole selected dataset(s) are exported
+as `AnnData`, Scanpy or RAPIDS should own the usual analysis preprocessing.
 
-## Tool Boundary
+## Public handoff API
 
-Use `corpus.to_anndata(...)` when one dataset or one deterministic subset will
-fit in memory and you want Scanpy or RAPIDS to own the next analysis steps.
-
-Use Scanpy or RAPIDS for:
-
-- normalization and log transforms for analysis objects
-- PCA and alternative dimensionality reduction
-- neighbors, UMAP, clustering, and plotting
-- exploratory marker ranking or differential expression
-- batch correction and other analysis-side transforms
-
-Use corpus-native `perturb_data_lab.pp` helpers for:
-
-- durable or recalculated per-dataset HVG rankings
-- streamed summary statistics over the on-disk corpus
-- quick QA/debug checks without constructing `AnnData`
-- bounded-memory fallback workflows when Scanpy/RAPIDS handoff is not practical
-
-Important current limits:
-
-- `to_anndata(...)` is per-dataset only and eager; it is not a backed or fully on-disk Scanpy workflow.
-- Corpus extraction is counts-only: it builds CSR `adata.X` and does not add normalized or log-transformed layers.
-- Scanpy, RAPIDS, and `rapids-singlecell` are user-managed optional dependencies.
-- Internal `pp` should not grow into a full replacement for Scanpy/RAPIDS.
-
-## Imports
+The handoff API has three parts:
 
 ```python
-from perturb_data_lab.loaders import load_corpus, select_obs_indices
-from perturb_data_lab.pp import calculate_hvgs, run_pca
+adata = corpus.to_anndata(dataset_id="replogle_k562")
+adata = corpus.to_anndata_lazy(dataset_id="replogle_k562", chunk_rows=4096)
+corpus.add_obs_meta(frame, on=["dataset_id", "cell_id"])
 ```
 
-If you want centered `method="incremental_pca"`, install the optional PCA
-dependency first:
+- `to_anndata(...)` builds a normal in-memory AnnData with SciPy CSR `X`.
+- `to_anndata_lazy(...)` builds an AnnData whose `X` is a Dask array of sparse CSR chunks read from the corpus backend.
+- `add_obs_meta(...)` joins selected cell-level results back into the loaded corpus metadata at runtime.
 
-```bash
-pip install ".[pca]"
-```
+AnnData handoff is intentionally whole-dataset only. It does not accept
+`row_indices` or `local_row_indices`. Once data is in AnnData, subsetting should
+happen on the AnnData object.
 
-## Dry-run before eager AnnData construction
+## Feature-axis rule
 
-Load extra canonical metadata columns up front if you want to stratify on them
-or include them in `adata.obs`:
+Single-dataset handoff is always allowed.
+
+Multi-dataset handoff is allowed only when all selected datasets have exactly the
+same ordered feature axis:
+
+- same number of features
+- same `canonical_gene_id` values
+- same feature order
+
+This check happens before expression is read. If the feature axes differ, the
+export fails instead of trying to silently remap sparse indices.
+
+Cross-dataset feature reconciliation is a separate future feature. It would need
+a real transformation layer that remaps local feature indices while reading each
+chunk.
+
+## Eager AnnData handoff
+
+Use `to_anndata(...)` when the selected whole dataset(s) fit in RAM:
 
 ```python
+from perturb_data_lab.loaders import load_corpus
+
 corpus = load_corpus(
     "/path/to/corpus",
     extra_metadata_columns=["donor_id", "batch_id"],
 )
 
-estimate = corpus.to_anndata(
+adata = corpus.to_anndata(
     dataset_id="replogle_k562",
-    obs_columns=["perturb_label", "donor_id"],
-    var_columns=["gene_id"],
-    dry_run=True,
-    max_memory_bytes=8_000_000_000,
-    on_exceed="warn",
-)
-
-print(estimate["n_obs"], estimate["n_vars"], estimate["nnz"])
-print(estimate["csr_memory_bytes"])
-print(estimate["selected_row_index_summary"])
-```
-
-- `dry_run=True` returns shape, `nnz`, CSR memory estimates, metadata footprint estimates, and memory-guard status without materializing `adata.X`.
-- Set `on_exceed="raise"` when you want the same request to fail before eager construction if `max_memory_bytes` is exceeded.
-
-## Deterministic observation selection
-
-### Random subset
-
-```python
-random_selection = select_obs_indices(
-    corpus,
-    dataset_id="replogle_k562",
-    strategy="random",
-    max_cells=20_000,
-    seed=17,
+    obs_columns=["perturb_label", "donor_id", "batch_id"],
 )
 ```
 
-### Stratified subset
-
-```python
-stratified_selection = corpus.select_obs_indices(
-    dataset_id="replogle_k562",
-    strategy="stratified",
-    max_cells=20_000,
-    stratify_by=["perturb_label"],
-    seed=17,
-)
-```
-
-### Balanced subset with provenance
-
-```python
-balanced_selection = corpus.select_obs_indices(
-    dataset_id="replogle_k562",
-    strategy="balanced",
-    max_cells=20_000,
-    stratify_by=["perturb_label", "donor_id"],
-    max_per_group=500,
-    drop_null_groups=True,
-    seed=17,
-)
-
-balanced_selection.write_provenance("./artifacts/selections/replogle-balanced")
-```
-
-- Returned `row_indices` are corpus-global row indices and can be passed directly into `to_anndata(...)` or `run_pca(...)`.
-- Provenance outputs should go to repo-local real directories such as `./artifacts/...`, never to `data/`, `pertTF/`, or `perturb/`.
-
-## Eager AnnData handoff
-
-`to_anndata(...)` exports raw counts only. Any normalization, log transform,
-dimensionality reduction, clustering, or plotting below is intentionally owned by
-the Scanpy/RAPIDS-side workflow, not by the materialized corpus.
+For compatible datasets:
 
 ```python
 adata = corpus.to_anndata(
-    dataset_id="replogle_k562",
-    row_indices=balanced_selection.row_indices,
-    obs_columns=["perturb_label", "donor_id"],
+    dataset_id=["dataset_a", "dataset_b"],
+    obs_columns=["perturb_label", "donor_id", "batch_id"],
 )
 ```
 
-`adata.obs` always includes stable provenance fields such as `dataset_id`,
-`dataset_index`, `global_row_index`, and `local_row_index`; requested
-`obs_columns` are added alongside them.
+The export is counts-only. It builds CSR `adata.X` and does not add normalized or
+log-transformed layers.
 
-`adata.var` includes dataset-local feature identifiers plus global feature IDs.
+`adata.obs` includes stable provenance fields such as `dataset_id`,
+`dataset_index`, `global_row_index`, `local_row_index`, and `cell_id` when those
+columns are present in the loaded metadata. Requested `obs_columns` are added
+alongside them.
+
+`adata.var` comes from the first selected dataset after the shared feature-axis
+check.
+
+## Lazy AnnData handoff
+
+Use `to_anndata_lazy(...)` when the selected whole dataset(s) should stay on disk
+and be read in chunks by Dask:
+
+```python
+adata = corpus.to_anndata_lazy(
+    dataset_id="replogle_k562",
+    obs_columns=["perturb_label", "donor_id", "batch_id"],
+    chunk_rows=4096,
+)
+```
+
+Only `adata.X` is lazy. `adata.obs` and `adata.var` are loaded in memory because
+they are small compared with the count matrix.
+
+The Dask chunks are CSR matrices. Each chunk reads a contiguous row block from
+the active corpus backend:
+
+- Zarr chunks read `row_offsets`, `indices`, and `counts` through the Zarr expression reader.
+- Lance chunks read row blocks through the Lance expression reader and unpack Arrow list columns.
+
+This keeps the handoff lightweight: no new AnnData-Zarr copy is required just to
+let AnnData hold a Dask-backed `X`.
 
 ## Scanpy example
 
@@ -156,8 +121,8 @@ sc.tl.umap(adata)
 sc.tl.leiden(adata)
 ```
 
-Use this route for ordinary single-dataset or subset analysis when `adata.X`
-fits in CPU memory.
+Use this route when the selected AnnData representation is supported by the
+Scanpy function you are calling. Scanpy Dask support is function-specific.
 
 ## RAPIDS example
 
@@ -174,87 +139,69 @@ rsc.tl.umap(adata)
 rsc.tl.leiden(adata)
 ```
 
-Use this route when the exported subset fits GPU memory and the needed
-`rapids-singlecell` functions support the matrix representation you are using.
-For very large matrices, first reduce the cells or genes exported to `AnnData`.
+RAPIDS can convert Dask CPU CSR chunks to GPU-backed chunks for supported
+functions. RAPIDS Dask support is still function-specific; for example,
+`rank_genes_groups` supports Dask for `t-test`, `t-test_overestim_var`, and
+`wilcoxon_binned`, but not regular `wilcoxon` or `logreg`.
 
-## Corpus-native HVG and fallback PCA
+## Adding results back to the corpus
 
-The repo still keeps small streamed helpers because they work directly from the
-on-disk corpus. The most important durable artifact is the per-dataset
-`hvg.parquet` ranking table created during materialization or by `recalc-hvg`.
-
-```python
-hvg_frame = calculate_hvgs(
-    corpus,
-    dataset_id="replogle_k562",
-    batch_size=1024,
-    n_hvg=2000,
-)
-```
-
-Use streamed PCA only when you specifically need a bounded-memory fallback over
-the corpus instead of a normal Scanpy/RAPIDS analysis object:
+`perturb-data-lab` does not decide how Scanpy/RAPIDS outputs are saved. The user
+owns the AnnData workflow and can add selected cell-level results back to the
+loaded corpus with `add_obs_meta(...)`:
 
 ```python
-fit_selection = corpus.select_obs_indices(
-    dataset_id="replogle_k562",
-    strategy="balanced",
-    max_cells=20_000,
-    stratify_by=["perturb_label"],
-    max_per_group=500,
-    seed=17,
+corpus.add_obs_meta(
+    adata.obs[["dataset_id", "cell_id", "leiden", "doublet_score"]],
+    on=["dataset_id", "cell_id"],
 )
+```
 
-transform_selection = corpus.select_obs_indices(
-    dataset_id="replogle_k562",
-    strategy="random",
-    max_cells=80_000,
-    seed=23,
-)
+`add_obs_meta(...)` is strict:
 
-result = run_pca(
+- join keys are required
+- incoming rows must cover the full loaded corpus exactly once
+- duplicate join keys are rejected
+- missing corpus rows are rejected
+- extra unmatched rows are rejected
+- new metadata column names must not already exist in the corpus
+- the update is runtime-only and does not persist to disk
+
+Preferred join keys are:
+
+- `on=["dataset_id", "cell_id"]`
+- `on=["dataset_id", "local_row_index"]`
+- `on=["global_row_index"]`
+
+For a multi-dataset loaded corpus, analyze all feature-compatible datasets
+together or combine per-dataset result frames before calling `add_obs_meta(...)`.
+Partial subset metadata is rejected because it would leave the corpus in a
+half-annotated runtime state.
+
+After adding metadata, downstream loaders can use the new columns for sampling or
+pass-through metadata:
+
+```python
+from perturb_data_lab.loaders import build_loader
+
+loader = build_loader(
     corpus,
-    dataset_id="replogle_k562",
-    method="incremental_pca",
-    batch_size=1024,
-    n_components=50,
-    hvg_frame=hvg_frame,
-    fit_row_indices=fit_selection.row_indices,
-    transform_row_indices=transform_selection.row_indices,
-    max_dense_batch_bytes=2_000_000_000,
-    output_dir="./artifacts/pp/replogle-ipca",
-    overwrite=True,
+    sampler="context",
+    batch_size=128,
+    seq_len=1024,
+    context_columns=["leiden", "perturb_label"],
+    metadata_columns=["leiden", "doublet_score"],
 )
 ```
 
-- `fit_row_indices` lets you fit on a bounded deterministic subset while `transform_row_indices` controls which rows receive embeddings.
-- Omit `transform_row_indices` to transform all rows in the requested dataset.
-- `max_dense_batch_bytes` guards the dense `batch_size x selected_features` working set before outputs are written.
-- Treat `run_pca(...)` as a fallback/debug path, not the preferred full analysis stack.
+## Corpus-native pp helpers
 
-## Future large-scale handoff
+Use Scanpy or RAPIDS for normalization, log transforms, PCA, neighbors, UMAP,
+clustering, plotting, batch correction, and exploratory marker ranking.
 
-The preferred large-scale direction is an AnnData-Zarr or Dask-backed CSR bridge
-from the existing Zarr matrix artifacts. The current Zarr layout already has the
-same CSR pieces expected by AnnData:
+Use corpus-native `perturb_data_lab.pp` helpers for durable HVG rankings,
+streamed summary statistics, quick QA/debug checks, and bounded-memory fallback
+workflows when AnnData handoff is not practical.
 
-```text
-current corpus Zarr      AnnData CSR group
-counts              ->   X/data
-indices             ->   X/indices
-row_offsets         ->   X/indptr
-```
-
-This path should support per-dataset lazy handoff before a multi-dataset handoff.
-
-Multi-dataset AnnData export needs an explicit column coordinate system. Current
-materialized sparse rows store dataset-local feature indices, while a combined
-AnnData object needs one shared feature axis. That means a multi-dataset export
-must remap local feature indices to corpus-global feature IDs before writing or
-presenting `X`.
-
-Lance should remain optimized for training/runtime row reads for now. Modifying
-AnnData backed internals to read Lance directly is not the first target because
-it is more fragile than exporting or viewing the Zarr CSR arrays through standard
-AnnData/Dask conventions.
+The most important durable artifact is the per-dataset `hvg.parquet` ranking
+table created during materialization or by `recalc-hvg`.
