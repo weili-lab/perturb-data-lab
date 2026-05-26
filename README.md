@@ -19,7 +19,7 @@ raw h5ad
   -> draft/review final-schema.yaml
   -> canonicalize
   -> load_corpus()
-  -> optional pertTF loader, AnnData handoff, or streamed pp helpers
+  -> optional pertTF loader, AnnData/Scanpy/RAPIDS handoff, or corpus-native pp helpers
 ```
 
 The main public CLI commands are:
@@ -85,7 +85,7 @@ Important code areas:
 - `src/perturb_data_lab/materializers/`: count-matrix streaming, backend writers, manifests, and corpus registration
 - `src/perturb_data_lab/canonical/`: schema drafting, schema contracts, transforms, and canonicalization runner
 - `src/perturb_data_lab/loaders/`: `load_corpus()`, expression readers, metadata index, feature registry, samplers, and pertTF adapter
-- `src/perturb_data_lab/pp/`: streamed stats, HVG, PCA, and differential-expression helpers
+- `src/perturb_data_lab/pp/`: corpus-native streamed stats, HVG, and fallback PCA/DE helpers
 
 ## Documentation Map
 
@@ -93,7 +93,7 @@ Important code areas:
 - Inspection and materialization how-to: `docs/inspect_materialize.md`
 - Canonical schema review and canonicalization details: `docs/canonicalization_handbook.md`
 - pertTF-specific paired loader usage: `docs/perttf_loader.md`
-- AnnData, Scanpy, deterministic subsampling, and streamed PCA: `docs/anndata_scanpy_handoff.md`
+- AnnData/Scanpy/RAPIDS handoff and corpus-native pp helpers: `docs/anndata_scanpy_handoff.md`
 - Backend policy note: `docs/backend_note.md`
 
 ## Minimal CLI Example
@@ -163,7 +163,7 @@ Useful runtime methods:
 - `corpus.take_metadata(global_row_indices, columns=[...])`: read canonical metadata columns
 - `corpus.inspect_batch(global_row_indices, metadata_columns=[...])`: inspect expression plus metadata together
 - `corpus.loader(...)`: build an iterable sparse batch loader
-- `corpus.to_anndata(...)`: eager counts-only AnnData export for one dataset or subset
+- `corpus.to_anndata(...)`: eager counts-only AnnData handoff for one dataset or subset
 
 By default, `load_corpus()` loads core canonical metadata. Pass
 `extra_metadata_columns=[...]` when a downstream workflow needs additional

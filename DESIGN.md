@@ -45,7 +45,7 @@ The user-facing how-to docs are split by task:
 - Inspection and materialization: `docs/inspect_materialize.md`
 - Canonical schema review and canonicalization: `docs/canonicalization_handbook.md`
 - pertTF paired loading: `docs/perttf_loader.md`
-- AnnData/Scanpy handoff and streamed pp helpers: `docs/anndata_scanpy_handoff.md`
+- AnnData/Scanpy/RAPIDS handoff and corpus-native pp helpers: `docs/anndata_scanpy_handoff.md`
 - Backend policy: `docs/backend_note.md`
 
 ## 1. Inspection
@@ -195,10 +195,12 @@ The pertTF adapter uses `PertTFPairedBatchLoader` to form source/target paired
 batches with configurable labels, control definitions, row pools, and pairing
 groups. See `docs/perttf_loader.md`.
 
-The AnnData/Scanpy path uses `corpus.to_anndata(...)` for eager counts-only
-export of one dataset or a selected subset. Streamed `pp` helpers provide
-bounded-memory stats, HVG, PCA, and differential-expression utilities. See
-`docs/anndata_scanpy_handoff.md`.
+The AnnData/Scanpy/RAPIDS path uses `corpus.to_anndata(...)` for eager
+counts-only export of one dataset or a selected subset. After export,
+Scanpy/RAPIDS should own normalization, log transforms, PCA, neighbors, UMAP,
+clustering, plotting, and exploratory differential expression. Corpus-native
+`pp` helpers remain for durable HVG rankings, streamed stats, QA/debug checks,
+and bounded-memory fallbacks. See `docs/anndata_scanpy_handoff.md`.
 
 ## Corpus Management Helpers
 
@@ -222,4 +224,5 @@ internals.
 - Canonicalization adds reviewed metadata; it does not mutate materialized expression rows.
 - The loader requires canonical metadata; it does not infer a final schema from raw sidecars.
 - Feature identity is dataset-local at materialization time and corpus-global at load time.
+- The repo does not aim to replace Scanpy/RAPIDS for full exploratory preprocessing.
 - Current mainline docs describe Lance/Zarr only.
