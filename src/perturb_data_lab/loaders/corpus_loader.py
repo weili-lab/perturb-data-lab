@@ -118,6 +118,7 @@ class Corpus:
         dataset_id: str | Sequence[str],
         obs_columns: Sequence[str] | None = None,
         chunk_rows: int = 4096,
+        device: str = "cpu",
     ):
         """Export whole selected dataset(s) as AnnData with Dask-backed ``X``.
 
@@ -128,6 +129,7 @@ class Corpus:
 
         if int(chunk_rows) <= 0:
             raise ValueError("chunk_rows must be positive")
+        lazy_device = _normalize_lazy_device(device)
         selected = _normalize_dataset_selection(dataset_id)
         var_df = _load_shared_var(self, selected)
         obs = _build_obs_dataframe(self, selected, obs_columns=obs_columns)
@@ -136,6 +138,7 @@ class Corpus:
             selected,
             n_vars=var_df.height,
             chunk_rows=int(chunk_rows),
+            device=lazy_device,
         )
         return ad.AnnData(X=x, obs=obs, var=_var_dataframe_to_pandas(var_df))
 
@@ -183,6 +186,29 @@ def _build_range_entries(
     ]
 
 
+def _resolve_zarr_csr_paths(matrix_root: Path, stem: str) -> tuple[Path, Path, Path]:
+    csr_path = matrix_root / f"{stem}-csr.zarr"
+    if csr_path.is_dir():
+        return csr_path, csr_path, csr_path
+
+    row_offsets_path = matrix_root / f"{stem}-row-offsets.zarr"
+    indices_path = matrix_root / f"{stem}-indices.zarr"
+    counts_path = matrix_root / f"{stem}-counts.zarr"
+    if not row_offsets_path.is_dir():
+        raise FileNotFoundError(
+            f"Zarr row-offsets artifact not found for '{stem}': {row_offsets_path}"
+        )
+    if not indices_path.is_dir():
+        raise FileNotFoundError(
+            f"Zarr indices artifact not found for '{stem}': {indices_path}"
+        )
+    if not counts_path.is_dir():
+        raise FileNotFoundError(
+            f"Zarr counts artifact not found for '{stem}': {counts_path}"
+        )
+    return row_offsets_path, indices_path, counts_path
+
+
 def _build_aggregate_expression_components(
     root: Path,
     backend: str,
@@ -202,22 +228,9 @@ def _build_aggregate_expression_components(
             lance_path=str(lance_path),
         )
 
-    row_offsets_path = root / "matrix" / "aggregated-row-offsets.zarr"
-    indices_path = root / "matrix" / "aggregated-indices.zarr"
-    counts_path = root / "matrix" / "aggregated-counts.zarr"
-    if not row_offsets_path.is_dir():
-        raise FileNotFoundError(
-            "Aggregate Zarr row-offsets artifact not found: "
-            f"{row_offsets_path}"
-        )
-    if not indices_path.is_dir():
-        raise FileNotFoundError(
-            f"Aggregate Zarr indices artifact not found: {indices_path}"
-        )
-    if not counts_path.is_dir():
-        raise FileNotFoundError(
-            f"Aggregate Zarr counts artifact not found: {counts_path}"
-        )
+    row_offsets_path, indices_path, counts_path = _resolve_zarr_csr_paths(
+        root / "matrix", "aggregated"
+    )
     return entries, build_expression_reader(
         backend,
         "aggregate",
@@ -250,24 +263,9 @@ def _build_federated_dataset_entry(
             lance_path=str(lance_path),
         )
 
-    row_offsets_path = matrix_root / f"{dataset_id}-row-offsets.zarr"
-    indices_path = matrix_root / f"{dataset_id}-indices.zarr"
-    counts_path = matrix_root / f"{dataset_id}-counts.zarr"
-    if not row_offsets_path.is_dir():
-        raise FileNotFoundError(
-            f"Zarr row-offsets artifact not found for dataset '{dataset_id}': "
-            f"{row_offsets_path}"
-        )
-    if not indices_path.is_dir():
-        raise FileNotFoundError(
-            f"Zarr indices artifact not found for dataset '{dataset_id}': "
-            f"{indices_path}"
-        )
-    if not counts_path.is_dir():
-        raise FileNotFoundError(
-            f"Zarr counts artifact not found for dataset '{dataset_id}': "
-            f"{counts_path}"
-        )
+    row_offsets_path, indices_path, counts_path = _resolve_zarr_csr_paths(
+        matrix_root, dataset_id
+    )
     return ZarrDatasetEntry(
         dataset_id=dataset_id,
         global_start=global_start,
@@ -438,15 +436,80 @@ def _expression_batch_to_csr(batch: ExpressionBatch, *, n_vars: int):
     )
 
 
-def _read_expression_csr_block(
+def _expression_batch_to_cupy_csr(
+    batch: ExpressionBatch,
+    *,
+    n_vars: int,
+    device: str,
+):
+    try:
+        import cupy as cp
+        from cupyx.scipy import sparse as cupyx_sparse
+    except ImportError as exc:
+        raise ImportError("device='cuda' requires cupy and cupyx") from exc
+
+    try:
+        with cp.cuda.Device(_cupy_device_id(device)):
+            return cupyx_sparse.csr_matrix(
+                (
+                    cp.asarray(batch.expression_counts),
+                    cp.asarray(batch.expressed_gene_indices),
+                    cp.asarray(batch.row_offsets),
+                ),
+                shape=(batch.batch_size, int(n_vars)),
+                dtype=cp.int32,
+            )
+    except Exception as exc:
+        raise RuntimeError("device='cuda' requires a working CUDA/CuPy runtime") from exc
+
+
+def _normalize_lazy_device(device: str) -> str:
+    normalized = str(device).lower()
+    if normalized == "cpu" or normalized == "cuda":
+        return normalized
+    if normalized.startswith("cuda:"):
+        _cupy_device_id(normalized)
+        return normalized
+    raise ValueError("device must be 'cpu', 'cuda', or 'cuda:<index>'")
+
+
+def _cupy_device_id(device: str) -> int:
+    if device == "cuda":
+        return 0
+    return int(device.split(":", 1)[1])
+
+
+def _lazy_sparse_meta(device: str):
+    if device == "cpu":
+        from scipy import sparse
+
+        return sparse.csr_matrix((0, 0), dtype=np.int32)
+
+    try:
+        import cupy as cp
+        from cupyx.scipy import sparse as cupyx_sparse
+    except ImportError as exc:
+        raise ImportError("device='cuda' requires cupy and cupyx") from exc
+
+    try:
+        with cp.cuda.Device(_cupy_device_id(device)):
+            return cupyx_sparse.csr_matrix((0, 0), dtype=cp.int32)
+    except Exception as exc:
+        raise RuntimeError("device='cuda' requires a working CUDA/CuPy runtime") from exc
+
+
+def _read_expression_sparse_block(
     reader: ExpressionReader,
     start: int,
     stop: int,
     n_vars: int,
+    device: str,
 ):
     indices = list(range(int(start), int(stop)))
     batch = reader.read_expression_flat(indices)
-    return _expression_batch_to_csr(batch, n_vars=n_vars)
+    if device == "cpu":
+        return _expression_batch_to_csr(batch, n_vars=n_vars)
+    return _expression_batch_to_cupy_csr(batch, n_vars=n_vars, device=device)
 
 
 def _build_lazy_expression_matrix(
@@ -455,23 +518,24 @@ def _build_lazy_expression_matrix(
     *,
     n_vars: int,
     chunk_rows: int,
+    device: str,
 ):
     import dask.array as da
     from dask import delayed
-    from scipy import sparse
 
     entries = _entry_map(corpus)
     blocks = []
-    meta = sparse.csr_matrix((0, 0), dtype=np.int32)
+    meta = _lazy_sparse_meta(device)
     for ds_id in dataset_ids:
         entry = entries[ds_id]
         for start in range(entry.global_start, entry.global_end, int(chunk_rows)):
             stop = min(start + int(chunk_rows), entry.global_end)
-            task = delayed(_read_expression_csr_block)(
+            task = delayed(_read_expression_sparse_block)(
                 corpus.expression_reader,
                 start,
                 stop,
                 int(n_vars),
+                device,
             )
             blocks.append(
                 da.from_delayed(

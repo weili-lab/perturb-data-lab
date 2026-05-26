@@ -3,31 +3,42 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from ..chunk_translation import ChunkBundle
 
 
+_ROW_OFFSET_CHUNK = 65_536
+_ROW_OFFSET_SHARD = 1_048_576
+_NNZ_CHUNK = 1_048_576
+_NNZ_SHARD = 16_777_216
+
+
+def _create_sharded_array(group: Any, name: str, *, shape: tuple[int, ...], dtype: str):
+    chunks = (_ROW_OFFSET_CHUNK,) if name == "row_offsets" else (_NNZ_CHUNK,)
+    shards = (_ROW_OFFSET_SHARD,) if name == "row_offsets" else (_NNZ_SHARD,)
+    return group.create_array(
+        name,
+        shape=shape,
+        dtype=dtype,
+        chunks=chunks,
+        shards=shards,
+    )
+
+
 def _open_zarr_state(
-    paths: dict[str, Path],
+    csr_path: Path,
     bundle: ChunkBundle,
     *,
     append_existing: bool,
 ) -> dict[str, Any]:
     import zarr
 
-    existing = [paths[name].exists() for name in ("indices", "counts", "row_offsets")]
-    if append_existing and any(existing):
-        if not all(existing):
-            raise FileNotFoundError(
-                f"incomplete aggregate Zarr artifacts in {paths['indices'].parent}"
-            )
-        indices_zarr = zarr.open(str(paths["indices"]), mode="a")
-        counts_zarr = zarr.open(str(paths["counts"]), mode="a")
-        row_offsets_zarr = zarr.open(str(paths["row_offsets"]), mode="a")
-        indices = indices_zarr["indices"]
-        counts = counts_zarr["counts"]
-        row_offsets = row_offsets_zarr["row_offsets"]
+    if append_existing and csr_path.exists():
+        csr_zarr = zarr.open_group(str(csr_path), mode="a")
+        indices = cast(Any, csr_zarr["indices"])
+        counts = cast(Any, csr_zarr["counts"])
+        row_offsets = cast(Any, csr_zarr["row_offsets"])
         current_nnz = int(indices.shape[0])
         current_rows = int(row_offsets.shape[0]) - 1
         if counts.shape[0] != current_nnz or current_rows < 0:
@@ -36,21 +47,20 @@ def _open_zarr_state(
             raise ValueError("aggregate Zarr row_offsets[-1] does not match stored nnz")
     else:
         initial_nnz = max(len(bundle.indices), 1)
-        indices_zarr = zarr.open(str(paths["indices"]), mode="w")
-        counts_zarr = zarr.open(str(paths["counts"]), mode="w")
-        row_offsets_zarr = zarr.open(str(paths["row_offsets"]), mode="w")
-        indices_zarr.create_dataset("indices", shape=(initial_nnz,), dtype="i4")
-        counts_zarr.create_dataset("counts", shape=(initial_nnz,), dtype="i4")
-        row_offsets_zarr.create_dataset(
-            "row_offsets", shape=(bundle.row_count + 1,), dtype="i8"
+        csr_zarr = zarr.open_group(str(csr_path), mode="w", zarr_format=3)
+        _create_sharded_array(csr_zarr, "indices", shape=(initial_nnz,), dtype="i4")
+        _create_sharded_array(csr_zarr, "counts", shape=(initial_nnz,), dtype="i4")
+        _create_sharded_array(
+            csr_zarr,
+            "row_offsets",
+            shape=(bundle.row_count + 1,),
+            dtype="i8",
         )
         current_nnz = 0
         current_rows = 0
 
     return {
-        "indices_zarr": indices_zarr,
-        "counts_zarr": counts_zarr,
-        "row_offsets_zarr": row_offsets_zarr,
+        "csr_zarr": csr_zarr,
         "global_nnz": current_nnz,
         "row_count": current_rows,
     }
@@ -64,9 +74,24 @@ def _write_zarr(
     _is_last_chunk: bool,
     append_existing: bool,
 ) -> tuple[dict[str, Path], dict[str, Any] | None]:
-    paths["indices"].parent.mkdir(parents=True, exist_ok=True)
+    csr_path = paths["csr"]
+    csr_path.parent.mkdir(parents=True, exist_ok=True)
+    if (
+        append_existing
+        and _writer_state is None
+        and not csr_path.exists()
+        and bundle.row_count
+        and int(bundle.global_row_index[0]) != 0
+    ):
+        raise FileNotFoundError(
+            f"aggregate Zarr CSR artifact not found for append: {csr_path}"
+        )
     if _writer_state is None:
-        _writer_state = _open_zarr_state(paths, bundle, append_existing=append_existing)
+        _writer_state = _open_zarr_state(
+            csr_path,
+            bundle,
+            append_existing=append_existing,
+        )
 
     assert bundle.indptr[0] == 0, f"chunk indptr[0] == {bundle.indptr[0]}, expected 0"
     current_nnz = _writer_state["global_nnz"]
@@ -79,15 +104,15 @@ def _write_zarr(
             f"{current_rows}, got {int(bundle.global_row_index[0])}"
         )
 
-    row_offsets = _writer_state["row_offsets_zarr"]["row_offsets"]
+    row_offsets = _writer_state["csr_zarr"]["row_offsets"]
     ro_end = current_rows + chunk_rows + 1
     if ro_end > row_offsets.shape[0]:
         row_offsets.resize((ro_end,))
     row_offsets[current_rows:ro_end] = bundle.indptr + current_nnz
 
     needed_nnz = current_nnz + chunk_nnz
-    indices = _writer_state["indices_zarr"]["indices"]
-    counts = _writer_state["counts_zarr"]["counts"]
+    indices = _writer_state["csr_zarr"]["indices"]
+    counts = _writer_state["csr_zarr"]["counts"]
     if needed_nnz > indices.shape[0]:
         indices.resize((needed_nnz,))
         counts.resize((needed_nnz,))
@@ -114,9 +139,7 @@ def write_zarr_federated(
     _is_last_chunk: bool = False,
 ) -> tuple[dict[str, Path], dict[str, Any] | None]:
     paths = {
-        "indices": matrix_root / f"{dataset_id}-indices.zarr",
-        "counts": matrix_root / f"{dataset_id}-counts.zarr",
-        "row_offsets": matrix_root / f"{dataset_id}-row-offsets.zarr",
+        "csr": matrix_root / f"{dataset_id}-csr.zarr",
     }
     return _write_zarr(
         bundle=bundle,
@@ -136,9 +159,7 @@ def write_zarr_aggregate(
     _is_last_chunk: bool = False,
 ) -> tuple[dict[str, Path], dict[str, Any] | None]:
     paths = {
-        "indices": matrix_root / "aggregated-indices.zarr",
-        "counts": matrix_root / "aggregated-counts.zarr",
-        "row_offsets": matrix_root / "aggregated-row-offsets.zarr",
+        "csr": matrix_root / "aggregated-csr.zarr",
     }
     return _write_zarr(
         bundle=bundle,

@@ -107,6 +107,21 @@ the active corpus backend:
 This keeps the handoff lightweight: no new AnnData-Zarr copy is required just to
 let AnnData hold a Dask-backed `X`.
 
+For GPU workflows, `to_anndata_lazy(..., device="cuda")` makes each Dask task
+build a CuPy CSR chunk directly:
+
+```python
+adata = corpus.to_anndata_lazy(
+    dataset_id="replogle_k562",
+    chunk_rows=4096,
+    device="cuda",
+)
+```
+
+This still reads Lance/Zarr buffers through CPU memory before the CPU-to-GPU
+transfer, but it avoids constructing an intermediate SciPy CSR matrix inside the
+Dask task. It requires a working CUDA/CuPy runtime.
+
 ## Scanpy example
 
 ```python
@@ -139,10 +154,10 @@ rsc.tl.umap(adata)
 rsc.tl.leiden(adata)
 ```
 
-RAPIDS can convert Dask CPU CSR chunks to GPU-backed chunks for supported
-functions. RAPIDS Dask support is still function-specific; for example,
-`rank_genes_groups` supports Dask for `t-test`, `t-test_overestim_var`, and
-`wilcoxon_binned`, but not regular `wilcoxon` or `logreg`.
+RAPIDS can work with GPU-backed chunks for supported functions. RAPIDS Dask
+support is still function-specific; for example, `rank_genes_groups` supports
+Dask for `t-test`, `t-test_overestim_var`, and `wilcoxon_binned`, but not
+regular `wilcoxon` or `logreg`.
 
 ## Adding results back to the corpus
 

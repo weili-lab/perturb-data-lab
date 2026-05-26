@@ -117,17 +117,24 @@ def _write_zarr_rows(matrix_root: Path, rows: list[dict[str, Any]]) -> None:
         counts.extend(row["expression_counts"])
         row_offsets.append(len(indices))
 
+    group = zarr.open_group(
+        str(matrix_root / "aggregated-csr.zarr"),
+        mode="w",
+        zarr_format=3,
+    )
     arrays = {
-        "aggregated-row-offsets.zarr": ("row_offsets", np.asarray(row_offsets, dtype=np.int64)),
-        "aggregated-indices.zarr": ("indices", np.asarray(indices, dtype=np.int32)),
-        "aggregated-counts.zarr": ("counts", np.asarray(counts, dtype=np.int32)),
+        "row_offsets": np.asarray(row_offsets, dtype=np.int64),
+        "indices": np.asarray(indices, dtype=np.int32),
+        "counts": np.asarray(counts, dtype=np.int32),
     }
-    for store_name, (array_name, values) in arrays.items():
-        group = zarr.open(str(matrix_root / store_name), mode="w")
-        if hasattr(group, "create_dataset"):
-            arr = group.create_dataset(array_name, shape=values.shape, dtype=values.dtype)
-        else:
-            arr = group.create_array(array_name, shape=values.shape, dtype=values.dtype)
+    for array_name, values in arrays.items():
+        arr = group.create_array(
+            array_name,
+            shape=values.shape,
+            dtype=values.dtype,
+            chunks=(4,),
+            shards=(16,),
+        )
         arr[:] = values
 
 
@@ -280,6 +287,28 @@ def test_to_anndata_lazy_builds_dask_sparse_x(tmp_path: Path, builder) -> None:
     assert computed.shape == (4, N_GENES)
 
 
+def test_to_anndata_lazy_rejects_unknown_device(tmp_path: Path) -> None:
+    _build_aggregate_lance_corpus(tmp_path)
+    corpus = load_corpus(tmp_path)
+
+    with pytest.raises(ValueError, match="device must be"):
+        corpus.to_anndata_lazy(dataset_id="mock_00", device="gpu")
+    with pytest.raises(ValueError):
+        corpus.to_anndata_lazy(dataset_id="mock_00", device="cuda:x")
+
+
+def test_load_corpus_reads_sharded_zarr_layout(tmp_path: Path) -> None:
+    _build_aggregate_zarr_corpus(tmp_path)
+    assert (tmp_path / "matrix" / "aggregated-csr.zarr").is_dir()
+    assert not (tmp_path / "matrix" / "aggregated-indices.zarr").exists()
+
+    corpus = load_corpus(tmp_path)
+    batch = corpus.expression_reader.read_expression_flat([0, 4])
+
+    assert batch.batch_size == 2
+    np.testing.assert_array_equal(batch.global_row_index, [0, 4])
+
+
 def test_add_obs_meta_requires_full_corpus_coverage(tmp_path: Path) -> None:
     _build_aggregate_lance_corpus(tmp_path)
     corpus = load_corpus(tmp_path)
@@ -327,6 +356,16 @@ def test_validate_corpus_structure_checks_aggregate_corpus(tmp_path: Path) -> No
     assert report["topology"] == "aggregate"
     assert report["dataset_count"] == 2
     assert report["total_rows"] == 9
+
+
+def test_validate_corpus_structure_checks_aggregate_zarr(tmp_path: Path) -> None:
+    _build_aggregate_zarr_corpus(tmp_path)
+
+    report = validate_corpus_structure(tmp_path, sample_n=4, seed=1)
+
+    assert report["status"] == "success"
+    assert report["backend"] == "zarr"
+    assert report["matrix"]["checked_layout"] == "aggregate"
 
 
 def test_validate_corpus_structure_checks_federated_corpus(tmp_path: Path) -> None:

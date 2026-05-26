@@ -98,7 +98,11 @@ class LanceDatasetEntry(DatasetEntry):
 
 @dataclass(frozen=True)
 class ZarrDatasetEntry(DatasetEntry):
-    """Zarr-specific dataset entry with paths to the CSR-format arrays."""
+    """Zarr-specific dataset entry with paths to the CSR-format arrays.
+
+    For the v3 sharded CSR layout, all three paths point to the same Zarr
+    group. Legacy corpora keep one Zarr group per array.
+    """
 
     offsets_path: str | Path
     indices_path: str | Path

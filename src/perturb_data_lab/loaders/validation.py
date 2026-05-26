@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import polars as pl
@@ -157,9 +157,7 @@ def _validate_matrix_storage(
             _validate_lance_rows(root / "matrix" / "aggregated-cells.lance", total_rows)
         else:
             _validate_zarr_arrays(
-                root / "matrix" / "aggregated-row-offsets.zarr",
-                root / "matrix" / "aggregated-indices.zarr",
-                root / "matrix" / "aggregated-counts.zarr",
+                *_resolve_zarr_csr_paths(root / "matrix", "aggregated"),
                 total_rows,
             )
         return {"checked_layout": "aggregate", "row_count": total_rows}
@@ -173,12 +171,21 @@ def _validate_matrix_storage(
             )
         else:
             _validate_zarr_arrays(
-                paths.matrix_root / f"{dataset['dataset_id']}-row-offsets.zarr",
-                paths.matrix_root / f"{dataset['dataset_id']}-indices.zarr",
-                paths.matrix_root / f"{dataset['dataset_id']}-counts.zarr",
+                *_resolve_zarr_csr_paths(paths.matrix_root, dataset["dataset_id"]),
                 dataset["cell_count"],
             )
     return {"checked_layout": "federated", "row_count": datasets[-1]["global_end"]}
+
+
+def _resolve_zarr_csr_paths(matrix_root: Path, stem: str) -> tuple[Path, Path, Path]:
+    csr_path = matrix_root / f"{stem}-csr.zarr"
+    if csr_path.is_dir():
+        return csr_path, csr_path, csr_path
+    return (
+        matrix_root / f"{stem}-row-offsets.zarr",
+        matrix_root / f"{stem}-indices.zarr",
+        matrix_root / f"{stem}-counts.zarr",
+    )
 
 
 def _validate_lance_rows(path: Path, expected_rows: int) -> None:
@@ -205,9 +212,12 @@ def _validate_zarr_arrays(
         raise FileNotFoundError("Zarr row_offsets, indices, and counts artifacts must all exist")
     import zarr
 
-    row_offsets = zarr.open(str(row_offsets_path), mode="r")["row_offsets"][:]
-    indices = zarr.open(str(indices_path), mode="r")["indices"]
-    counts = zarr.open(str(counts_path), mode="r")["counts"]
+    row_offsets_group = cast(Any, zarr.open(str(row_offsets_path), mode="r"))
+    indices_group = cast(Any, zarr.open(str(indices_path), mode="r"))
+    counts_group = cast(Any, zarr.open(str(counts_path), mode="r"))
+    row_offsets = row_offsets_group["row_offsets"][:]
+    indices = indices_group["indices"]
+    counts = counts_group["counts"]
     if len(row_offsets) != expected_rows + 1:
         raise AssertionError("Zarr row_offsets length does not match expected rows")
     if int(row_offsets[0]) != 0:
