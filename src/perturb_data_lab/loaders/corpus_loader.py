@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Sequence, cast
 
 import numpy as np
 import polars as pl
@@ -25,6 +25,7 @@ from .expression import (
 )
 from .feature_registry import FeatureRegistry
 from .index import MetadataIndex
+from .zarr_reading import normalize_zarr_read_engine
 
 from ..materializers.paths import resolve_corpus_paths
 
@@ -213,6 +214,8 @@ def _build_aggregate_expression_components(
     root: Path,
     backend: str,
     global_ranges: Sequence[tuple[str, int, int, int]],
+    *,
+    zarr_read_engine: str,
 ) -> tuple[list[DatasetEntry], ExpressionReader]:
     entries = _build_range_entries(global_ranges)
     if backend == "lance":
@@ -238,6 +241,7 @@ def _build_aggregate_expression_components(
         offsets_path=str(row_offsets_path),
         indices_path=str(indices_path),
         counts_path=str(counts_path),
+        read_engine=zarr_read_engine,
     )
 
 
@@ -280,12 +284,19 @@ def _build_federated_expression_components(
     root: Path,
     backend: str,
     global_ranges: Sequence[tuple[str, int, int, int]],
+    *,
+    zarr_read_engine: str,
 ) -> tuple[list[DatasetEntry], ExpressionReader]:
     entries = [
         _build_federated_dataset_entry(root, backend, ds_id, g_start, g_end)
         for ds_id, _dsi, g_start, g_end in global_ranges
     ]
-    return entries, build_expression_reader(backend, "federated", entries)
+    return cast(list[DatasetEntry], entries), build_expression_reader(
+        backend,
+        "federated",
+        cast(list[DatasetEntry], entries),
+        read_engine=zarr_read_engine,
+    )
 
 
 def _build_expression_components(
@@ -293,11 +304,23 @@ def _build_expression_components(
     topology: str,
     backend: str,
     global_ranges: Sequence[tuple[str, int, int, int]],
+    *,
+    zarr_read_engine: str,
 ) -> tuple[list[DatasetEntry], ExpressionReader]:
     if topology == "aggregate":
-        return _build_aggregate_expression_components(root, backend, global_ranges)
+        return _build_aggregate_expression_components(
+            root,
+            backend,
+            global_ranges,
+            zarr_read_engine=zarr_read_engine,
+        )
     if topology == "federated":
-        return _build_federated_expression_components(root, backend, global_ranges)
+        return _build_federated_expression_components(
+            root,
+            backend,
+            global_ranges,
+            zarr_read_engine=zarr_read_engine,
+        )
     raise ValueError(
         f"Unknown topology '{topology}'. "
         f"Expected 'aggregate' or 'federated'."
@@ -635,6 +658,7 @@ def load_corpus(
     corpus_root: str | Path,
     *,
     extra_metadata_columns: Sequence[str] | None = None,
+    zarr_read_engine: str = "zarr-python",
 ) -> Corpus:
     """Load a training-ready ``Corpus`` from a corpus directory.
 
@@ -680,6 +704,11 @@ def load_corpus(
     topology = str(metadata.get("topology", ""))
     raw_backend = str(metadata.get("backend", ""))
     backend = _normalize_backend(raw_backend)
+    resolved_zarr_read_engine = normalize_zarr_read_engine(zarr_read_engine)
+    if backend != "zarr" and resolved_zarr_read_engine != "zarr-python":
+        raise ValueError(
+            "zarr_read_engine is only supported when loading a Zarr corpus"
+        )
     datasets = index_doc.get("datasets", [])
     if not datasets:
         raise ValueError(
@@ -736,6 +765,7 @@ def load_corpus(
         topology,
         backend,
         global_ranges,
+        zarr_read_engine=resolved_zarr_read_engine,
     )
 
     # ------------------------------------------------------------------

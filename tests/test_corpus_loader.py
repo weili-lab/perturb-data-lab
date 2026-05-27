@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import lance
 import numpy as np
@@ -21,6 +21,7 @@ from perturb_data_lab.loaders import (
     collate_expression_batch,
 )
 from perturb_data_lab.loaders.corpus_loader import Corpus, load_corpus
+from perturb_data_lab.loaders.zarr_reading import open_csr_arrays
 from perturb_data_lab.loaders.validation import validate_corpus_structure
 
 
@@ -307,6 +308,35 @@ def test_load_corpus_reads_sharded_zarr_layout(tmp_path: Path) -> None:
 
     assert batch.batch_size == 2
     np.testing.assert_array_equal(batch.global_row_index, [0, 4])
+
+
+@pytest.mark.parametrize("engine", ["zarr-python", "zarrs", "tensorstore"])
+def test_optional_zarr_read_engines_match_sharded_csr_smoke(tmp_path: Path, engine: str) -> None:
+    if engine == "zarrs":
+        pytest.importorskip("zarrs")
+    if engine == "tensorstore":
+        pytest.importorskip("tensorstore")
+
+    _build_aggregate_zarr_corpus(tmp_path)
+    csr_path = tmp_path / "matrix" / "aggregated-csr.zarr"
+    arrays = open_csr_arrays(csr_path, csr_path, csr_path, read_engine=engine)
+    np.testing.assert_array_equal(np.asarray(arrays.row_offsets[:]), [0, 3, 6, 9, 12, 15, 18, 21, 24, 27])
+
+    baseline = load_corpus(tmp_path, zarr_read_engine="zarr-python")
+    routed = load_corpus(tmp_path, zarr_read_engine=engine)
+    expected = baseline.expression_reader.read_expression_flat([0, 4, 8])
+    observed = routed.expression_reader.read_expression_flat([0, 4, 8])
+
+    np.testing.assert_array_equal(observed.global_row_index, expected.global_row_index)
+    np.testing.assert_array_equal(observed.row_offsets, expected.row_offsets)
+    np.testing.assert_array_equal(observed.expressed_gene_indices, expected.expressed_gene_indices)
+    np.testing.assert_array_equal(observed.expression_counts, expected.expression_counts)
+
+    expected_lazy = cast(Any, baseline.to_anndata_lazy(dataset_id="mock_00", chunk_rows=2).X)
+    observed_lazy = cast(Any, routed.to_anndata_lazy(dataset_id="mock_00", chunk_rows=2).X)
+    expected_x = expected_lazy.compute().toarray()
+    observed_x = observed_lazy.compute().toarray()
+    np.testing.assert_array_equal(observed_x, expected_x)
 
 
 def test_add_obs_meta_requires_full_corpus_coverage(tmp_path: Path) -> None:

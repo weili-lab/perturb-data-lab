@@ -8,13 +8,15 @@ from typing import Any, cast
 from ..chunk_translation import ChunkBundle
 
 
-_ROW_OFFSET_CHUNK = 65_536
+_ROW_OFFSET_CHUNK = 4_096
 _ROW_OFFSET_SHARD = 1_048_576
-_NNZ_CHUNK = 1_048_576
+_NNZ_CHUNK = 131_072
 _NNZ_SHARD = 16_777_216
 
 
 def _create_sharded_array(group: Any, name: str, *, shape: tuple[int, ...], dtype: str):
+    from zarr.codecs import BloscCodec
+
     chunks = (_ROW_OFFSET_CHUNK,) if name == "row_offsets" else (_NNZ_CHUNK,)
     shards = (_ROW_OFFSET_SHARD,) if name == "row_offsets" else (_NNZ_SHARD,)
     return group.create_array(
@@ -23,6 +25,7 @@ def _create_sharded_array(group: Any, name: str, *, shape: tuple[int, ...], dtyp
         dtype=dtype,
         chunks=chunks,
         shards=shards,
+        compressors=[BloscCodec(cname="lz4")],
     )
 
 

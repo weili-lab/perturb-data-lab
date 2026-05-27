@@ -19,9 +19,11 @@ import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, Sequence
+from typing import Any, Protocol, Sequence
 
 import numpy as np
+
+from .zarr_reading import open_csr_arrays, normalize_zarr_read_engine
 
 __all__ = [
     "ExpressionBatch",
@@ -177,7 +179,7 @@ def _cell_arrays_to_expression_batch(
     """Convert ordered per-cell arrays into an ``ExpressionBatch``."""
     indices = np.array([int(idx) for idx in global_indices], dtype=np.int64)
     if len(cells) == 0:
-        return _empty_expression_batch(indices)
+        return _empty_expression_batch(indices.tolist())
 
     row_offsets = np.zeros(len(cells) + 1, dtype=np.int64)
     egi_parts: list[np.ndarray] = []
@@ -483,7 +485,7 @@ class FederatedLanceReader(BaseExpressionReader):
 
     def __init__(self, entries: list[LanceDatasetEntry]):
         super().__init__(entries)  # type: ignore[arg-type]
-        self._datasets: dict[str, "lance.Dataset"] = {}
+        self._datasets: dict[str, Any] = {}
         self._datasets_pid: int | None = None
 
     def __getstate__(self) -> dict[str, object]:
@@ -557,13 +559,20 @@ class AggregateZarrReader(BaseExpressionReader):
         indices_path: str | Path,
         counts_path: str | Path,
         entries: list[DatasetEntry],
+        *,
+        read_engine: str = "zarr-python",
     ):
         super().__init__(entries)
-        import zarr
-
-        self._offsets = zarr.open(str(offsets_path), mode="r")["row_offsets"]
-        self._indices = zarr.open(str(indices_path), mode="r")["indices"]
-        self._counts = zarr.open(str(counts_path), mode="r")["counts"]
+        self._read_engine = normalize_zarr_read_engine(read_engine)
+        arrays = open_csr_arrays(
+            offsets_path,
+            indices_path,
+            counts_path,
+            read_engine=self._read_engine,
+        )
+        self._offsets = arrays.row_offsets
+        self._indices = arrays.indices
+        self._counts = arrays.counts
 
     def _read_local_cells(
         self, entry: DatasetEntry, local_indices: list[int]
@@ -586,35 +595,22 @@ class FederatedZarrReader(BaseExpressionReader):
         One entry per dataset, each with its own Zarr array paths.
     """
 
-    def __init__(self, entries: list[ZarrDatasetEntry]):
+    def __init__(self, entries: list[ZarrDatasetEntry], *, read_engine: str = "zarr-python"):
         super().__init__(entries)  # type: ignore[arg-type]
-        self._offsets_cache: dict[str, np.ndarray] = {}
-        self._indices_cache: dict[str, np.ndarray] = {}
-        self._counts_cache: dict[str, np.ndarray] = {}
+        self._read_engine = normalize_zarr_read_engine(read_engine)
+        self._arrays_cache: dict[str, Any] = {}
 
     def _open_arrays(self, entry: ZarrDatasetEntry):
-        import zarr
-
         ds_id = entry.dataset_id
-        if (
-            ds_id not in self._offsets_cache
-            or ds_id not in self._indices_cache
-            or ds_id not in self._counts_cache
-        ):
-            self._offsets_cache[ds_id] = zarr.open(
-                str(entry.offsets_path), mode="r"
-            )["row_offsets"]
-            self._indices_cache[ds_id] = zarr.open(
-                str(entry.indices_path), mode="r"
-            )["indices"]
-            self._counts_cache[ds_id] = zarr.open(
-                str(entry.counts_path), mode="r"
-            )["counts"]
-        return (
-            self._offsets_cache[ds_id],
-            self._indices_cache[ds_id],
-            self._counts_cache[ds_id],
-        )
+        if ds_id not in self._arrays_cache:
+            self._arrays_cache[ds_id] = open_csr_arrays(
+                entry.offsets_path,
+                entry.indices_path,
+                entry.counts_path,
+                read_engine=self._read_engine,
+            )
+        arrays = self._arrays_cache[ds_id]
+        return arrays.row_offsets, arrays.indices, arrays.counts
 
     def _read_local_cells(
         self, entry: DatasetEntry, local_indices: list[int]
@@ -675,13 +671,20 @@ def build_expression_reader(
             return FederatedLanceReader(entries)  # type: ignore[arg-type]
 
     elif backend == "zarr":
+        read_engine = kwargs.pop("read_engine", "zarr-python")
         if topology == "aggregate":
             offsets_path = kwargs.pop("offsets_path")
             indices_path = kwargs.pop("indices_path")
             counts_path = kwargs.pop("counts_path")
-            return AggregateZarrReader(offsets_path, indices_path, counts_path, entries)
+            return AggregateZarrReader(
+                offsets_path,
+                indices_path,
+                counts_path,
+                entries,
+                read_engine=read_engine,
+            )
         else:
-            return FederatedZarrReader(entries)  # type: ignore[arg-type]
+            return FederatedZarrReader(entries, read_engine=read_engine)  # type: ignore[arg-type]
 
     raise ValueError(f"Unknown backend '{backend}'. Supported: lance, zarr.")
 

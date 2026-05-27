@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any, cast
 
 import numpy as np
@@ -59,3 +60,12 @@ def test_zarr_writer_uses_single_v3_sharded_csr_group(tmp_path) -> None:
     np.testing.assert_array_equal(row_offsets[:], [0, 2, 3, 4, 6])
     np.testing.assert_array_equal(indices[:], [0, 3, 1, 2, 0, 4])
     np.testing.assert_array_equal(counts[:], [1, 2, 3, 1, 2, 3])
+
+    row_offsets_meta = json.loads((matrix_root / "aggregated-csr.zarr" / "row_offsets" / "zarr.json").read_text())
+    indices_meta = json.loads((matrix_root / "aggregated-csr.zarr" / "indices" / "zarr.json").read_text())
+    assert row_offsets_meta["codecs"][0]["configuration"]["chunk_shape"] == [4_096]
+    assert indices_meta["codecs"][0]["configuration"]["chunk_shape"] == [131_072]
+    assert row_offsets_meta["codecs"][0]["configuration"]["codecs"][1]["name"] == "blosc"
+    assert indices_meta["codecs"][0]["configuration"]["codecs"][1]["name"] == "blosc"
+    assert row_offsets_meta["codecs"][0]["configuration"]["codecs"][1]["configuration"]["cname"] == "lz4"
+    assert indices_meta["codecs"][0]["configuration"]["codecs"][1]["configuration"]["cname"] == "lz4"

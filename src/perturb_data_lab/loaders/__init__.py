@@ -12,6 +12,7 @@ from .expression import (
     ZarrDatasetEntry,
     build_expression_reader,
 )
+from .zarr_reading import ZARR_READ_ENGINES, normalize_zarr_read_engine, open_csr_arrays
 from .index import MetadataIndex
 from .adapters import (
     ExpressionBatchDataset,
@@ -57,6 +58,9 @@ __all__ = [
     "LanceDatasetEntry",
     "ZarrDatasetEntry",
     "build_expression_reader",
+    "ZARR_READ_ENGINES",
+    "normalize_zarr_read_engine",
+    "open_csr_arrays",
     # Phase 3 — Core types
     "ExpressionBatch",
     # Phase 3 — Samplers (MetadataIndex-backed)
