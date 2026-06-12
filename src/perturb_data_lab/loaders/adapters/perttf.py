@@ -112,6 +112,7 @@ class PertTFAdapterConfig:
     mask_ratio: float = 0.15
     ps_width: int = 1
     include_full_expr: bool = False
+    normalize_expression: str = "none"
 
     def __post_init__(self) -> None:
         if not self.label_fields:
@@ -154,6 +155,11 @@ class PertTFAdapterConfig:
             raise ValueError("mask_ratio must be between 0 and 1")
         if int(self.ps_width) <= 0:
             raise ValueError("ps_width must be positive")
+        if self.normalize_expression not in {"none", "log1p"}:
+            raise ValueError(
+                f"normalize_expression must be 'none' or 'log1p', "
+                f"got {self.normalize_expression!r}"
+            )
 
     @property
     def metadata_columns(self) -> tuple[str, ...]:
@@ -878,6 +884,9 @@ class PertTFPairedBatchBuilder:
         target_raw = self._with_metadata_columns(target_raw)
         self._check_raw_pair_batch(pair_batch, source_raw, target_raw)
 
+        source_raw = self._normalize_expression_raw(source_raw)
+        target_raw = self._normalize_expression_raw(target_raw)
+
         source_processed = self._pipeline.process_batch(
             source_raw,
             device=self.device,
@@ -1048,6 +1057,17 @@ class PertTFPairedBatchBuilder:
                 expected_indices,
             ):
                 raise ValueError(f"{name} global_row_index does not match pair_batch ordering")
+
+    def _normalize_expression_raw(self, raw_batch: dict[str, Any]) -> dict[str, Any]:
+        if self.config.normalize_expression == "none":
+            return raw_batch
+        if self.config.normalize_expression == "log1p":
+            counts = np.asarray(raw_batch["expression_counts"], dtype=np.float32)
+            raw_batch["expression_counts"] = np.log1p(counts)
+            return raw_batch
+        raise ValueError(
+            f"unsupported normalize_expression: {self.config.normalize_expression!r}"
+        )
 
     def _raw_batch_numpy(
         self,
