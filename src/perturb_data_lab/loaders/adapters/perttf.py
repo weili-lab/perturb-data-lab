@@ -1202,27 +1202,17 @@ class PertTFPairedBatchBuilder:
         if self.config.mask_ratio <= 0.0:
             return values.clone()
         masked = values.clone()
-        pad_value = float(self.config.pad_value)
-        cls_value = float(self.config.cls_value)
-        mask_value = float(self.config.mask_value)
-        for row_idx in range(masked.shape[0]):
-            eligible = torch.nonzero(
-                (masked[row_idx] != pad_value) & (masked[row_idx] != cls_value),
-                as_tuple=False,
-            ).flatten()
-            if eligible.numel() == 0:
-                continue
-            n_mask = int(eligible.numel() * float(self.config.mask_ratio))
-            if n_mask <= 0:
-                continue
-            chosen = eligible[
-                torch.randperm(
-                    eligible.numel(),
-                    generator=generator,
-                    device=eligible.device,
-                )[:n_mask]
-            ]
-            masked[row_idx, chosen] = mask_value
+        eligible = (
+            (masked != float(self.config.pad_value))
+            & (masked != float(self.config.cls_value))
+        )
+        scores = torch.rand(
+            masked.shape,
+            device=masked.device,
+            generator=generator,
+        )
+        mask = (scores < float(self.config.mask_ratio)) & eligible
+        masked[mask] = float(self.config.mask_value)
         return masked
 
     def _size_factor_tensor(
