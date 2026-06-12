@@ -884,9 +884,6 @@ class PertTFPairedBatchBuilder:
         target_raw = self._with_metadata_columns(target_raw)
         self._check_raw_pair_batch(pair_batch, source_raw, target_raw)
 
-        source_raw = self._normalize_expression_raw(source_raw)
-        target_raw = self._normalize_expression_raw(target_raw)
-
         source_processed = self._pipeline.process_batch(
             source_raw,
             device=self.device,
@@ -920,6 +917,9 @@ class PertTFPairedBatchBuilder:
             raise RuntimeError(
                 "target reconstruction changed valid source-sampled gene IDs"
             )
+
+        source_processed = self._normalize_sampled_counts(source_processed)
+        target_processed = self._normalize_sampled_counts(target_processed)
 
         gene_ids, source_token_valid_mask = self._to_token_ids(
             source_sampled_gene_ids,
@@ -1058,13 +1058,21 @@ class PertTFPairedBatchBuilder:
             ):
                 raise ValueError(f"{name} global_row_index does not match pair_batch ordering")
 
-    def _normalize_expression_raw(self, raw_batch: dict[str, Any]) -> dict[str, Any]:
+    def _normalize_sampled_counts(
+        self, processed: dict[str, Any]
+    ) -> dict[str, Any]:
         if self.config.normalize_expression == "none":
-            return raw_batch
+            return processed
         if self.config.normalize_expression == "log1p":
-            counts = np.asarray(raw_batch["expression_counts"], dtype=np.float32)
-            raw_batch["expression_counts"] = np.log1p(counts)
-            return raw_batch
+            sf = processed["size_factor"]
+            counts = processed["sampled_counts"]
+            valid = processed["valid_mask"]
+            processed["sampled_counts"] = torch.where(
+                valid,
+                torch.log1p(counts * sf.unsqueeze(1)),
+                counts,
+            )
+            return processed
         raise ValueError(
             f"unsupported normalize_expression: {self.config.normalize_expression!r}"
         )
@@ -1210,6 +1218,14 @@ class PertTFPairedBatchBuilder:
                 dtype=torch.float32,
                 device=self.device,
             )
+
+        if self.config.normalize_expression == "log1p" and "size_factor" in raw_batch:
+            sf = torch.as_tensor(
+                raw_batch["size_factor"],
+                dtype=torch.float32,
+                device=self.device,
+            )
+            full_expr = torch.log1p(full_expr * sf.unsqueeze(1))
 
         return self._prepend_cls_values(full_expr), self._prepend_cls_mask(full_mask)
 
