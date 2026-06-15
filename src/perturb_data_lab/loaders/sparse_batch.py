@@ -12,7 +12,6 @@ from typing import Any
 
 import numpy as np
 import torch
-from torch.nn.utils.rnn import pad_sequence
 
 from .feature_registry import FeatureRegistry
 
@@ -454,23 +453,7 @@ class SparseBatchProcessor:
 
         # ---- Compute per-cell NNZ lengths ----
         row_lengths = row_offsets[1:] - row_offsets[:-1]  # (batch_size,)
-
-        # ---- Split + pad local gene indices and counts ----
-        split_sizes = tuple(int(x) for x in row_lengths.cpu().tolist())
-        split_genes = list(torch.split(flat_gene_indices, split_sizes))
-        split_cnts = list(torch.split(flat_counts, split_sizes))
-
-        # Pad with max_local_vocab (>= all valid local indices) so padding
-        # positions can be distinguished and mapped to a global sentinel.
-        _local_pad = self._max_local_vocab
-        padded_local_genes = pad_sequence(
-            split_genes, batch_first=True, padding_value=_local_pad
-        )  # (batch_size, max_nnz)
-        padded_counts = pad_sequence(
-            split_cnts, batch_first=True, padding_value=0.0
-        )  # (batch_size, max_nnz)
-
-        max_nnz = int(padded_local_genes.shape[1])
+        max_nnz = int(row_lengths.max().item())
 
         # ---- Short-circuit when all cells have zero expressed genes ----
         if max_nnz == 0:
@@ -517,6 +500,22 @@ class SparseBatchProcessor:
                 has_gene_t=has_gene_t,
                 size_factor=size_factor,
             )
+
+        # ---- Scatter flat genes/counts into padded (batch_size, max_nnz) matrix ----
+        _local_pad = self._max_local_vocab
+        row_ids = torch.repeat_interleave(
+            torch.arange(bsz, device=device), row_lengths
+        )
+        col_ids = (
+            torch.arange(flat_gene_indices.numel(), device=device)
+            - row_offsets[row_ids]
+        )
+        padded_local_genes = torch.full(
+            (bsz, max_nnz), _local_pad, dtype=torch.long, device=device
+        )
+        padded_counts = torch.zeros(bsz, max_nnz, dtype=torch.float32, device=device)
+        padded_local_genes[row_ids, col_ids] = flat_gene_indices
+        padded_counts[row_ids, col_ids] = flat_counts
 
         # ---- Local→Global resolution ----
         is_padding = padded_local_genes >= self._max_local_vocab
