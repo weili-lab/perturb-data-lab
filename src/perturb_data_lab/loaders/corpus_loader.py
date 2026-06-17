@@ -9,7 +9,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence, cast
+from typing import Any, Literal, Sequence, cast
+import warnings
 
 import numpy as np
 import polars as pl
@@ -96,21 +97,36 @@ class Corpus:
         *,
         dataset_id: str | Sequence[str],
         obs_columns: Sequence[str] | None = None,
+        var_join: Literal["inner", "exact"] = "exact",
     ):
         """Export whole selected dataset(s) as an in-memory AnnData object.
 
-        The selected datasets must share the same ordered ``canonical_gene_id``
-        axis. Arbitrary row subsets are intentionally not supported; any subset
-        or feature remapping should happen after the AnnData object exists.
+        By default ``var_join="exact"`` requires the selected datasets to share
+        the same ordered ``canonical_gene_id`` axis.  Use ``var_join="inner"``
+        to export the intersection of their gene features instead.
         """
         import anndata as ad
+        from scipy import sparse
 
         selected = _normalize_dataset_selection(dataset_id)
-        var_df = _load_shared_var(self, selected)
+        var_df, n_vars, mapping = _resolve_var_axis(self, selected, var_join)
         obs = _build_obs_dataframe(self, selected, obs_columns=obs_columns)
-        global_indices = _selected_dataset_global_indices(self, selected)
-        batch = self.expression_reader.read_expression_flat(global_indices.tolist())
-        x = _expression_batch_to_csr(batch, n_vars=var_df.height)
+
+        if mapping is None and len(selected) == 1:
+            global_indices = _selected_dataset_global_indices(self, selected)
+            batch = self.expression_reader.read_expression_flat(global_indices.tolist())
+            x = _expression_batch_to_csr(batch, n_vars=n_vars)
+        else:
+            entries = _entry_map(self)
+            blocks = []
+            for ds_id in selected:
+                entry = entries[ds_id]
+                indices = np.arange(entry.global_start, entry.global_end, dtype=np.int64)
+                batch = self.expression_reader.read_expression_flat(indices.tolist())
+                lm = mapping[ds_id] if mapping is not None else None
+                blocks.append(_expression_batch_to_csr(batch, n_vars=n_vars, local_to_output=lm))
+            x = sparse.vstack(blocks)
+
         return ad.AnnData(X=x, obs=obs, var=_var_dataframe_to_pandas(var_df))
 
     def to_anndata_lazy(
@@ -120,6 +136,7 @@ class Corpus:
         obs_columns: Sequence[str] | None = None,
         chunk_rows: int = 4096,
         device: str = "cpu",
+        var_join: Literal["inner", "exact"] = "exact",
     ):
         """Export whole selected dataset(s) as AnnData with Dask-backed ``X``.
 
@@ -132,14 +149,15 @@ class Corpus:
             raise ValueError("chunk_rows must be positive")
         lazy_device = _normalize_lazy_device(device)
         selected = _normalize_dataset_selection(dataset_id)
-        var_df = _load_shared_var(self, selected)
+        var_df, n_vars, mapping = _resolve_var_axis(self, selected, var_join)
         obs = _build_obs_dataframe(self, selected, obs_columns=obs_columns)
         x = _build_lazy_expression_matrix(
             self,
             selected,
-            n_vars=var_df.height,
+            n_vars=n_vars,
             chunk_rows=int(chunk_rows),
             device=lazy_device,
+            per_dataset_local_to_output=mapping,
         )
         return ad.AnnData(X=x, obs=obs, var=_var_dataframe_to_pandas(var_df))
 
@@ -389,22 +407,65 @@ def _load_sorted_var_frame(corpus: Corpus, dataset_id: str) -> pl.DataFrame:
     ).sort("origin_index")
 
 
-def _load_shared_var(
+def _resolve_var_axis(
     corpus: Corpus,
     dataset_ids: Sequence[str],
-) -> pl.DataFrame:
+    var_join: Literal["inner", "exact"],
+) -> tuple[pl.DataFrame, int, dict[str, np.ndarray] | None]:
+    """Resolve shared var axis across selected datasets.
+
+    Returns ``(var_df, n_vars, per_dataset_local_to_output)`` where
+    ``per_dataset_local_to_output`` is ``None`` when axes match exactly
+    (local gene index == output column index for all datasets).
+    """
+    named_vars = {ds_id: _load_sorted_var_frame(corpus, ds_id) for ds_id in dataset_ids}
     first_id = dataset_ids[0]
-    first_var = _load_sorted_var_frame(corpus, first_id)
-    first_axis = first_var["canonical_gene_id"].to_list()
+    first_genes = named_vars[first_id]["canonical_gene_id"].to_list()
+
+    axes_match = True
     for ds_id in dataset_ids[1:]:
-        other_var = _load_sorted_var_frame(corpus, ds_id)
-        other_axis = other_var["canonical_gene_id"].to_list()
-        if other_axis != first_axis:
+        if named_vars[ds_id]["canonical_gene_id"].to_list() != first_genes:
+            axes_match = False
+            break
+
+    if axes_match or var_join == "exact":
+        if not axes_match:
+            # axes_match implies we entered the loop above, so ds_id from
+            # the first mismatching iteration is bound
             raise ValueError(
-                "selected datasets do not share the same ordered canonical_gene_id axis: "
-                f"{first_id!r} vs {ds_id!r}"
+                "selected datasets do not share the same ordered canonical_gene_id axis"
             )
-    return first_var
+        return named_vars[first_id], len(first_genes), None
+
+    intersection = [g for g in first_genes if all(
+        g in named_vars[ds]["canonical_gene_id"] for ds in dataset_ids[1:]
+    )]
+    if not intersection:
+        raise ValueError(
+            "no common genes across selected datasets"
+        )
+
+    warnings.warn(
+        f"selected datasets do not share identical ordered canonical_gene_id axes; "
+        f"exporting {len(intersection)} intersection genes",
+        UserWarning,
+    )
+
+    gene_to_out = {g: i for i, g in enumerate(intersection)}
+    var_df = named_vars[first_id].filter(
+        pl.col("canonical_gene_id").is_in(intersection)
+    )
+
+    mapping: dict[str, np.ndarray] = {}
+    for ds_id in dataset_ids:
+        local_genes = named_vars[ds_id]["canonical_gene_id"].to_list()
+        arr = np.full(len(local_genes), -1, dtype=np.int32)
+        for li, g in enumerate(local_genes):
+            if g in gene_to_out:
+                arr[li] = gene_to_out[g]
+        mapping[ds_id] = arr
+
+    return var_df, len(intersection), mapping
 
 
 def _resolve_obs_columns(
@@ -445,18 +506,31 @@ def _var_dataframe_to_pandas(var_df: pl.DataFrame):
     return var
 
 
-def _expression_batch_to_csr(batch: ExpressionBatch, *, n_vars: int):
+def _expression_batch_to_csr(batch: ExpressionBatch, *, n_vars: int, local_to_output: np.ndarray | None = None):
     from scipy import sparse
 
+    counts = batch.expression_counts
+    col_indices = batch.expressed_gene_indices
+    row_offsets = batch.row_offsets
+    if local_to_output is not None:
+        col_indices = local_to_output[col_indices]
+        keep = col_indices >= 0
+        col_indices = col_indices[keep]
+        counts = counts[keep]
+        row_offsets = _recompute_row_offsets(batch.row_offsets, keep)
     return sparse.csr_matrix(
-        (
-            batch.expression_counts,
-            batch.expressed_gene_indices,
-            batch.row_offsets,
-        ),
+        (counts, col_indices, row_offsets),
         shape=(batch.batch_size, int(n_vars)),
         dtype=np.float32,
     )
+
+
+def _recompute_row_offsets(orig_offsets: np.ndarray, keep: np.ndarray) -> np.ndarray:
+    keep_int = keep.astype(np.int32)
+    row_nnz = np.add.reduceat(keep_int, orig_offsets[:-1])
+    new_offsets = np.zeros(len(orig_offsets), dtype=np.int64)
+    new_offsets[1:] = np.cumsum(row_nnz)
+    return new_offsets
 
 
 def _expression_batch_to_cupy_csr(
@@ -464,6 +538,7 @@ def _expression_batch_to_cupy_csr(
     *,
     n_vars: int,
     device: str,
+    local_to_output: np.ndarray | None = None,
 ):
     try:
         import cupy as cp
@@ -471,13 +546,23 @@ def _expression_batch_to_cupy_csr(
     except ImportError as exc:
         raise ImportError("device='cuda' requires cupy and cupyx") from exc
 
+    counts = batch.expression_counts
+    col_indices = batch.expressed_gene_indices
+    row_offsets = batch.row_offsets
+    if local_to_output is not None:
+        col_indices = local_to_output[col_indices]
+        keep = col_indices >= 0
+        col_indices = col_indices[keep]
+        counts = counts[keep]
+        row_offsets = _recompute_row_offsets(batch.row_offsets, keep)
+
     try:
         with cp.cuda.Device(_cupy_device_id(device)):
             return cupyx_sparse.csr_matrix(
                 (
-                    cp.asarray(batch.expression_counts),
-                    cp.asarray(batch.expressed_gene_indices),
-                    cp.asarray(batch.row_offsets),
+                    cp.asarray(counts),
+                    cp.asarray(col_indices),
+                    cp.asarray(row_offsets),
                 ),
                 shape=(batch.batch_size, int(n_vars)),
                 dtype=cp.float32,
@@ -527,12 +612,13 @@ def _read_expression_sparse_block(
     stop: int,
     n_vars: int,
     device: str,
+    local_to_output: np.ndarray | None = None,
 ):
     indices = list(range(int(start), int(stop)))
     batch = reader.read_expression_flat(indices)
     if device == "cpu":
-        return _expression_batch_to_csr(batch, n_vars=n_vars)
-    return _expression_batch_to_cupy_csr(batch, n_vars=n_vars, device=device)
+        return _expression_batch_to_csr(batch, n_vars=n_vars, local_to_output=local_to_output)
+    return _expression_batch_to_cupy_csr(batch, n_vars=n_vars, device=device, local_to_output=local_to_output)
 
 
 def _build_lazy_expression_matrix(
@@ -542,6 +628,7 @@ def _build_lazy_expression_matrix(
     n_vars: int,
     chunk_rows: int,
     device: str,
+    per_dataset_local_to_output: dict[str, np.ndarray] | None = None,
 ):
     import dask.array as da
     from dask import delayed
@@ -551,6 +638,7 @@ def _build_lazy_expression_matrix(
     meta = _lazy_sparse_meta(device)
     for ds_id in dataset_ids:
         entry = entries[ds_id]
+        mapping = per_dataset_local_to_output.get(ds_id) if per_dataset_local_to_output is not None else None
         for start in range(entry.global_start, entry.global_end, int(chunk_rows)):
             stop = min(start + int(chunk_rows), entry.global_end)
             task = delayed(_read_expression_sparse_block)(
@@ -559,6 +647,7 @@ def _build_lazy_expression_matrix(
                 stop,
                 int(n_vars),
                 device,
+                mapping,
             )
             blocks.append(
                 da.from_delayed(

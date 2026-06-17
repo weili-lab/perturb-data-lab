@@ -271,6 +271,91 @@ def test_to_anndata_multi_dataset_requires_matching_feature_axis(tmp_path: Path)
         corpus.to_anndata(dataset_id=["mock_00", "mock_01"])
 
 
+def _make_var_df_mismatch(tmp_path: Path) -> None:
+    """Modify mock_01's var to have a partially overlapping gene set with mock_00."""
+    var_path = tmp_path / "meta" / "mock_01" / "canonical_meta" / "canonical-var.parquet"
+    var_df = pl.read_parquet(var_path).with_columns(
+        pl.Series(
+            "canonical_gene_id",
+            [f"GENE{i:05d}" for i in range(2, N_GENES + 2)],
+        )
+    )
+    var_df.write_parquet(var_path)
+
+
+def test_to_anndata_var_join_inner_intersection(tmp_path: Path) -> None:
+    import scipy.sparse as sp
+
+    _build_aggregate_lance_corpus(tmp_path)
+    _make_var_df_mismatch(tmp_path)
+    corpus = load_corpus(tmp_path)
+
+    with pytest.warns(UserWarning, match="intersection genes"):
+        adata = corpus.to_anndata(dataset_id=["mock_00", "mock_01"], var_join="inner")
+
+    expected_genes = [f"GENE{i:05d}" for i in range(2, 8)]  # overlap: GENE00002..GENE00007
+    assert adata.shape == (9, 6)
+    assert adata.var["canonical_gene_id"].tolist() == expected_genes
+    assert sp.isspmatrix_csr(adata.X)
+    assert adata.X.dtype == np.float32
+    assert set(adata.obs["dataset_id"]) == {"mock_00", "mock_01"}
+
+
+def test_to_anndata_var_join_inner_single_dataset_no_change(tmp_path: Path) -> None:
+    """Single dataset with var_join='inner' should behave same as exact."""
+    _build_aggregate_lance_corpus(tmp_path)
+    corpus = load_corpus(tmp_path)
+    adata = corpus.to_anndata(dataset_id="mock_00", var_join="inner")
+    assert adata.shape == (4, N_GENES)
+    assert adata.var["canonical_gene_id"].tolist() == [f"GENE{i:05d}" for i in range(N_GENES)]
+
+
+def test_to_anndata_var_join_exact_still_errors_on_mismatch(tmp_path: Path) -> None:
+    _build_aggregate_lance_corpus(tmp_path)
+    _make_var_df_mismatch(tmp_path)
+    corpus = load_corpus(tmp_path)
+
+    with pytest.raises(ValueError, match="same ordered canonical_gene_id"):
+        corpus.to_anndata(dataset_id=["mock_00", "mock_01"], var_join="exact")
+
+
+def test_to_anndata_var_join_inner_no_common_genes(tmp_path: Path) -> None:
+    _build_aggregate_lance_corpus(tmp_path)
+    var_path = tmp_path / "meta" / "mock_01" / "canonical_meta" / "canonical-var.parquet"
+    var_df = pl.read_parquet(var_path).with_columns(
+        pl.Series("canonical_gene_id", [f"OTHER{i:05d}" for i in range(N_GENES)])
+    )
+    var_df.write_parquet(var_path)
+    corpus = load_corpus(tmp_path)
+
+    with pytest.raises(ValueError, match="no common genes"):
+        corpus.to_anndata(dataset_id=["mock_00", "mock_01"], var_join="inner")
+
+
+def test_to_anndata_lazy_var_join_inner_intersection(tmp_path: Path) -> None:
+    import dask.array as da
+    import scipy.sparse as sp
+
+    _build_aggregate_lance_corpus(tmp_path)
+    _make_var_df_mismatch(tmp_path)
+    corpus = load_corpus(tmp_path)
+
+    with pytest.warns(UserWarning, match="intersection genes"):
+        adata = corpus.to_anndata_lazy(
+            dataset_id=["mock_00", "mock_01"], chunk_rows=2, var_join="inner"
+        )
+
+    expected_genes = [f"GENE{i:05d}" for i in range(2, 8)]
+    assert adata.shape == (9, 6)
+    assert adata.var["canonical_gene_id"].tolist() == expected_genes
+    assert isinstance(adata.X, da.Array)
+
+    computed = adata.X.compute()
+    assert sp.isspmatrix_csr(computed)
+    assert computed.shape == (9, 6)
+    assert computed.dtype == np.float32
+
+
 @pytest.mark.parametrize("builder", [_build_aggregate_lance_corpus, _build_aggregate_zarr_corpus])
 def test_to_anndata_lazy_builds_dask_sparse_x(tmp_path: Path, builder) -> None:
     import dask.array as da
