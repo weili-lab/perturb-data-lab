@@ -253,6 +253,7 @@ def test_to_anndata_exports_whole_dataset_as_csr(tmp_path: Path) -> None:
 
     assert adata.shape == (4, N_GENES)
     assert sp.isspmatrix_csr(adata.X)
+    assert adata.X.dtype == np.float32
     assert set(adata.obs["dataset_id"]) == {"mock_00"}
     assert adata.var["canonical_gene_id"].to_list() == [f"GENE{i:05d}" for i in range(N_GENES)]
 
@@ -286,6 +287,7 @@ def test_to_anndata_lazy_builds_dask_sparse_x(tmp_path: Path, builder) -> None:
     computed = adata.X.compute()
     assert sp.isspmatrix_csr(computed)
     assert computed.shape == (4, N_GENES)
+    assert computed.dtype == np.float32
 
 
 def test_to_anndata_lazy_rejects_unknown_device(tmp_path: Path) -> None:

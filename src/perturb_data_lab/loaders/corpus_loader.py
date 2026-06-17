@@ -455,7 +455,7 @@ def _expression_batch_to_csr(batch: ExpressionBatch, *, n_vars: int):
             batch.row_offsets,
         ),
         shape=(batch.batch_size, int(n_vars)),
-        dtype=np.int32,
+        dtype=np.float32,
     )
 
 
@@ -480,7 +480,7 @@ def _expression_batch_to_cupy_csr(
                     cp.asarray(batch.row_offsets),
                 ),
                 shape=(batch.batch_size, int(n_vars)),
-                dtype=cp.int32,
+                dtype=cp.float32,
             )
     except Exception as exc:
         raise RuntimeError("device='cuda' requires a working CUDA/CuPy runtime") from exc
@@ -506,7 +506,7 @@ def _lazy_sparse_meta(device: str):
     if device == "cpu":
         from scipy import sparse
 
-        return sparse.csr_matrix((0, 0), dtype=np.int32)
+        return sparse.csr_matrix((0, 0), dtype=np.float32)
 
     try:
         import cupy as cp
@@ -516,7 +516,7 @@ def _lazy_sparse_meta(device: str):
 
     try:
         with cp.cuda.Device(_cupy_device_id(device)):
-            return cupyx_sparse.csr_matrix((0, 0), dtype=cp.int32)
+            return cupyx_sparse.csr_matrix((0, 0), dtype=cp.float32)
     except Exception as exc:
         raise RuntimeError("device='cuda' requires a working CUDA/CuPy runtime") from exc
 
@@ -564,7 +564,7 @@ def _build_lazy_expression_matrix(
                 da.from_delayed(
                     task,
                     shape=(stop - start, int(n_vars)),
-                    dtype=np.int32,
+                    dtype=np.float32,
                     meta=meta,
                 )
             )
