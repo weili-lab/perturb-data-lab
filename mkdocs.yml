@@ -1,6 +1,6 @@
 site_name: perturb-data-lab
 site_description: A demo-first walkthrough for perturb-seq data preprocessing and loading
-repo_url: https://github.com/weililab/perturb-data-lab
+repo_url: https://github.com/weili-lab/perturb-data-lab
 edit_uri: edit/docs/github-pages-demo/docs/
 
 theme:
@@ -35,7 +35,9 @@ plugins:
   - search
 
 markdown_extensions:
+  - attr_list
   - admonition
+  - md_in_html
   - pymdownx.highlight
   - pymdownx.superfences
   - pymdownx.inlinehilite
