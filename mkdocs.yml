@@ -1,0 +1,44 @@
+site_name: perturb-data-lab
+site_description: A demo-first walkthrough for perturb-seq data preprocessing and loading
+repo_url: https://github.com/weililab/perturb-data-lab
+edit_uri: edit/docs/github-pages-demo/docs/
+
+theme:
+  name: material
+  palette:
+    primary: indigo
+    accent: indigo
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - content.code.copy
+    - content.code.annotate
+
+nav:
+  - Home: index.md
+  - Getting Started:
+    - Installation: installation.md
+  - Demo:
+    - Bash Materialization: bash_demo.md
+    - Jupyter Materialization: jupyter_demo.md
+  - Core Topics:
+    - Canonicalization: demo_canonicalization.md
+    - pertTF Loading: perttf_loader.md
+    - Scanpy & RAPIDS: scanpy_rapids.md
+  - Reference:
+    - Inspection & Materialization: inspect_materialize.md
+    - Canonicalization Handbook: canonicalization_handbook.md
+    - Backend Notes: backend_note.md
+    - AnnData Handoff API: anndata_scanpy_handoff.md
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - pymdownx.highlight
+  - pymdownx.superfences
+  - pymdownx.inlinehilite
+  - pymdownx.details
+  - toc:
+      permalink: true

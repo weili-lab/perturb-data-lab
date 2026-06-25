@@ -1,0 +1,147 @@
+kind: canonicalization-schema
+contract_version: 0.3.0
+dataset_id: marson_d2_rest
+status: ready
+description: Demo-reviewed canonicalization schema for the Marson D2 Rest subset.
+gene_mapping:
+  enabled: false
+  engine: identity
+  source_namespace: gene_symbol
+  target_namespace: gene_symbol
+  mapping_file: null
+obs_column_mappings:
+- canonical_name: assay
+  strategy: literal
+  literal_value: perturb-seq
+- canonical_name: batch_id
+  strategy: source-field
+  source_column: lane_id
+- canonical_name: cell_context
+  strategy: literal
+  literal_value: CD4+ T cells
+- canonical_name: cell_id
+  strategy: passthrough
+- canonical_name: cell_line_or_type
+  strategy: literal
+  literal_value: T cells
+- canonical_name: condition
+  strategy: coalesce
+  source_columns: [perturbed_gene_name, guide_group]
+  fallback: unknown
+  transforms:
+  - name: map_control_labels
+    args:
+      candidates: [NTC, no sgRNA]
+      output: ctrl
+- canonical_name: dataset_id
+  strategy: source-field
+  source_column: dataset_id
+- canonical_name: dataset_index
+  strategy: literal
+  literal_value: '0'
+- canonical_name: disease_state
+  strategy: literal
+  literal_value: healthy
+- canonical_name: donor_id
+  strategy: literal
+  literal_value: D2
+- canonical_name: dose
+  strategy: null
+- canonical_name: dose_unit
+  strategy: null
+- canonical_name: global_row_index
+  strategy: row-index
+- canonical_name: local_row_index
+  strategy: row-index
+- canonical_name: perturb_label
+  strategy: source-field
+  source_column: perturbed_gene_name
+  fallback: unknown
+  transforms:
+  - name: regex_sub
+    args:
+      pattern: '^NTC.*$'
+      replacement: NTC
+  - name: map_control_labels
+    args:
+      candidates: [NTC, no sgRNA]
+      output: ctrl
+- canonical_name: perturb_type
+  strategy: conditional
+  cases:
+  - source_column: guide_type
+    predicate: equals
+    value: non-targeting
+    result_literal: control
+  - source_column: guide_type
+    predicate: equals
+    value: targeting
+    result_literal: crispri
+  default_literal: control
+- canonical_name: sex
+  strategy: literal
+  literal_value: unknown
+- canonical_name: size_factor
+  strategy: source-field
+  source_column: size_factor
+- canonical_name: species
+  strategy: literal
+  literal_value: human
+- canonical_name: timepoint
+  strategy: literal
+  literal_value: '0'
+- canonical_name: timepoint_unit
+  strategy: literal
+  literal_value: h
+- canonical_name: tissue
+  strategy: literal
+  literal_value: blood
+obs_extensible:
+- raw_source_column: lane_id
+  canonical_name: lane_id
+- raw_source_column: n_genes_by_counts
+  canonical_name: n_genes_by_counts
+- raw_source_column: total_counts
+  canonical_name: total_counts
+- raw_source_column: pct_counts_mt
+  canonical_name: pct_counts_mt
+- raw_source_column: top_guide_UMI_counts
+  canonical_name: top_guide_UMI_counts
+- raw_source_column: guide_id
+  canonical_name: guide_id
+- raw_source_column: perturbed_gene_name
+  canonical_name: perturbed_gene_name
+- raw_source_column: perturbed_gene_id
+  canonical_name: perturbed_gene_id
+- raw_source_column: guide_type
+  canonical_name: guide_type
+- raw_source_column: PuroR
+  canonical_name: PuroR
+- raw_source_column: guide_group
+  canonical_name: guide_group
+- raw_source_column: low_quality
+  canonical_name: low_quality
+var_column_mappings:
+- canonical_name: origin_index
+  strategy: passthrough
+- canonical_name: gene_id
+  strategy: source-field
+  source_column: gene_name
+- canonical_name: canonical_gene_id
+  strategy: gene-mapping
+- canonical_name: global_id
+  strategy: auto
+var_extensible:
+- raw_source_column: gene_ids
+  canonical_name: gene_ids
+- raw_source_column: feature_types
+  canonical_name: feature_types
+- raw_source_column: genome
+  canonical_name: genome
+- raw_source_column: mt
+  canonical_name: mt
+notes:
+- Demo schema trimmed to the small Marson subset while keeping the reviewed source mapping logic.
+- dataset_index is fixed to 0 because the demo corpus is created with Marson first.
+- control rows are normalized to ctrl from NTC or no sgRNA labels.
+- native features stay untouched; gene_id comes from raw var.gene_name.
