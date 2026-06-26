@@ -6,10 +6,14 @@ to run the [Bash](bash_demo.md) or [Jupyter](jupyter_demo.md) demo.
 ## 1. Clone the repository
 
 ```bash
-git clone https://github.com/weililab/perturb-data-lab.git
+git clone https://github.com/weili-lab/perturb-data-lab.git
 cd perturb-data-lab
-git checkout docs/github-pages-demo
 ```
+
+Stay on the default `main` branch. All demo scripts, notebooks, and example
+schemas live on `main`. (This documentation site is published from a separate
+`docs/github-pages-demo` branch, but you do not need to check it out to run the
+demo.)
 
 ## 2. Set up a Python environment
 
@@ -116,4 +120,5 @@ from perturb_data_lab.loaders import load_corpus, PertTFAdapterConfig, PertTFPai
 
 - **[Bash Demo](bash_demo.md)** — copy-paste CLI walkthrough
 - **[Jupyter Demo](jupyter_demo.md)** — interactive Python walkthrough
+- **[Rendered Notebook](demo_walkthrough.ipynb)** — the executed walkthrough with cell outputs
 - **[Canonicalization](demo_canonicalization.md)** — learn the two demo schema decisions

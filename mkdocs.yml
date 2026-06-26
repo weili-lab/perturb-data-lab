@@ -21,6 +21,7 @@ nav:
   - Demo:
     - Bash Materialization: bash_demo.md
     - Jupyter Materialization: jupyter_demo.md
+    - Notebook Walkthrough: demo_walkthrough.ipynb
   - Core Topics:
     - Canonicalization: demo_canonicalization.md
     - pertTF Loading: perttf_loader.md
@@ -33,6 +34,10 @@ nav:
 
 plugins:
   - search
+  - mkdocs-jupyter:
+      execute: false
+      include_source: true
+      ignore: ["*.py"]
 
 markdown_extensions:
   - attr_list

@@ -6,3 +6,6 @@ dist/
 build/
 outputs/
 site/
+.cache/
+artifacts/
+demo_data/

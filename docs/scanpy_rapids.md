@@ -148,5 +148,6 @@ fail fast if the RAPIDS step cannot run.
 
 - [AnnData Handoff API](anndata_scanpy_handoff.md) — complete API reference
 - [Jupyter Demo](jupyter_demo.md) — the full notebook-style walkthrough
+- [Rendered Notebook](demo_walkthrough.ipynb) — the executed walkthrough with cell outputs
 - [Bash Demo](bash_demo.md) — end-to-end corpus preparation
 - [Canonicalization](demo_canonicalization.md) — how canonical labels enable downstream analysis

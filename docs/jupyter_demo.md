@@ -4,33 +4,50 @@ This page walks through the full demo workflow as a series of Python cells you
 can run in a Jupyter notebook, IPython session, or plain script. Each cell is
 self-contained and builds on the previous one.
 
+An executed version of this walkthrough is available as a rendered notebook:
+[demo walkthrough notebook](demo_walkthrough.ipynb).
+
 ## Prerequisites
 
 - [Installation](installation.md) completed and `pip install -e ".[demo]"` succeeded.
 - A working Python environment with `perturb_data_lab`, `anndata`, and `scanpy` importable.
-- Demo data downloaded (see Cell 1).
+- Demo data downloaded (see the download cell below).
 
 ---
 
-### Cell 1 — Download demo data
-
-```python
-# Run the bundled download script (or use huggingface_hub / wget directly)
-import subprocess
-import sys
-
-result = subprocess.run(
-    [sys.executable, "scripts/download_demo_data.py", "--output-dir", "./demo_data"],
-    capture_output=False,
-)
-```
-
-After download, verify the files exist:
+## Download demo data
 
 ```python
 from pathlib import Path
+import sys
+import requests
 
-demo_root = Path("./demo_data")
+repo_root = next(
+    p for p in (Path.cwd(), *Path.cwd().parents)
+    if (p / "src" / "perturb_data_lab").exists()
+)
+sys.path.insert(0, str(repo_root / "src"))
+
+demo_root = repo_root / "demo_data"
+base_url = "https://huggingface.co/datasets/weililab/perturb-data-lab-demo/resolve/main"
+files = [
+    "h5ad/demo_marson_d2_rest.h5ad",
+    "h5ad/demo_xorion_hct116_dual_guide.h5ad",
+    "checksums.txt",
+]
+
+for rel in files:
+    out = demo_root / rel
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if out.exists():
+        print(f"  {rel}: already exists")
+        continue
+    response = requests.get(f"{base_url}/{rel}", stream=True)
+    response.raise_for_status()
+    with open(out, "wb") as fh:
+        for chunk in response.iter_content(chunk_size=1024 * 1024):
+            fh.write(chunk)
+
 for rel in ["h5ad/demo_marson_d2_rest.h5ad", "h5ad/demo_xorion_hct116_dual_guide.h5ad"]:
     f = demo_root / rel
     size_mb = f.stat().st_size / 1e6 if f.exists() else 0
@@ -39,7 +56,7 @@ for rel in ["h5ad/demo_marson_d2_rest.h5ad", "h5ad/demo_xorion_hct116_dual_guide
 
 ---
 
-### Cell 2 — Inspect raw h5ad metadata
+## Inspect raw h5ad metadata
 
 Inspection reads metadata profiles and samples matrix candidates without loading
 full count matrices. The output `dataset-summary.yaml` tells you whether the
@@ -48,31 +65,32 @@ file is ready for materialization.
 ```python
 from pathlib import Path
 from perturb_data_lab.inspectors import inspect_target
-from perturb_data_lab.inspectors.models import InspectionTarget
+from perturb_data_lab.inspectors.models import DatasetSummaryDocument, InspectionTarget
 
-review_dir = Path("./artifacts/review")
+review_dir = repo_root / "artifacts" / "review"
 review_dir.mkdir(parents=True, exist_ok=True)
 
 datasets = [
-    ("marson_d2_rest", "./demo_data/h5ad/demo_marson_d2_rest.h5ad"),
-    ("xorion_hct116_dual_guide", "./demo_data/h5ad/demo_xorion_hct116_dual_guide.h5ad"),
+    ("marson_d2_rest", str(demo_root / "h5ad" / "demo_marson_d2_rest.h5ad")),
+    ("xorion_hct116_dual_guide", str(demo_root / "h5ad" / "demo_xorion_hct116_dual_guide.h5ad")),
 ]
 
 for ds_id, source_path in datasets:
-    result = inspect_target(
+    artifacts = inspect_target(
         InspectionTarget(dataset_id=ds_id, source_path=source_path, source_release=ds_id),
         review_dir,
     )
+    summary = DatasetSummaryDocument.from_yaml_file(artifacts.inspection_summary)
     print(f"\n{ds_id}:")
-    print(f"  cells: {result.n_obs}, features: {result.n_vars}")
-    print(f"  count source: {result.count_source}")
-    print(f"  readiness: {result.materialization_readiness}")
-    print(f"  obs fields ({len(result.obs_summary)}): {sorted(result.obs_summary.keys())[:10]}...")
+    print(f"  cells: {summary.dataset.obs_rows}, features: {summary.dataset.var_rows}")
+    print(f"  count source: {summary.count_source_decision.selected_candidate}")
+    print(f"  readiness: {summary.materialization_readiness}")
+    print(f"  obs fields ({len(summary.obs_fields)}): {[f.name for f in summary.obs_fields[:10]]}...")
 ```
 
 ---
 
-### Cell 3 — Quick peek at obs metadata
+## Quick peek at obs metadata
 
 Let's look at a few rows of raw metadata to understand what each dataset
 contains before canonicalization:
@@ -102,116 +120,101 @@ Expected observations:
 
 ---
 
-### Cell 4 — Materialize the corpus
+## Materialize a federated Lance corpus (both datasets at once)
 
-Create an aggregate Lance corpus and stream sparse counts from both `.h5ad` files:
+This builds a **federated** Lance corpus: each dataset gets its own isolated
+`matrix/` and `meta/` directory under `{corpus}/{dataset_id}/`. Both datasets
+are materialized in one Python loop using the materializer API.
 
 ```python
 from perturb_data_lab.materializers import DatasetMaterializer
-from perturb_data_lab.materializers.models import OutputRoots
+from perturb_data_lab.materializers.models import OutputRoots, CorpusIndexDocument
 from perturb_data_lab.materializers.paths import resolve_corpus_paths
-import yaml
 
-corpus_root = Path("./artifacts/demo_corpus")
+corpus_root = repo_root / "artifacts" / "demo_corpus"
 corpus_root.mkdir(parents=True, exist_ok=True)
 
-# Reuse the summaries from the CLI inspection for simplicity
-inspect_summary_dir = Path("./artifacts/review")
+for i, (ds_id, source_path) in enumerate(datasets):
+    paths = resolve_corpus_paths("federated", corpus_root, ds_id)
+    mode = "create" if i == 0 else "append"
 
-def load_summary(dataset_id):
-    path = inspect_summary_dir / dataset_id / "dataset-summary.yaml"
-    return yaml.safe_load(path.read_text())
+    materializer = DatasetMaterializer(
+        source_path=source_path,
+        inspection_summary_path=str(review_dir / ds_id / "dataset-summary.yaml"),
+        output_roots=OutputRoots(
+            metadata_root=str(paths.meta_root),
+            matrix_root=str(paths.matrix_root),
+        ),
+        dataset_id=ds_id,
+        backend="lance",
+        topology="federated",
+        corpus_index_path=str(corpus_root / "corpus-index.yaml"),
+        corpus_id="demo_corpus",
+        register=True,
+        mode=mode,
+        dataset_index=i,
+        global_row_start=0,  # corpus-index bookkeeping handles federated global ranges
+    )
+    manifest = materializer.materialize()
+    print(f"{mode}: {ds_id} -> {manifest.cell_count} cells, {manifest.feature_count} features")
 
-# Step 4a — Create corpus with Marson
-ds_id = "marson_d2_rest"
-paths = resolve_corpus_paths("aggregate", corpus_root, ds_id)
-summary = load_summary(ds_id)
-
-m = DatasetMaterializer(
-    source_path="./demo_data/h5ad/demo_marson_d2_rest.h5ad",
-    inspection_summary_path=str(inspect_summary_dir / ds_id / "dataset-summary.yaml"),
-    output_roots=OutputRoots(
-        metadata_root=str(paths.meta_root),
-        matrix_root=str(paths.matrix_root),
-    ),
-    dataset_id=ds_id,
-    backend="lance",
-    topology="aggregate",
-    corpus_index_path=str(corpus_root / "corpus-index.yaml"),
-    corpus_id="demo_corpus",
-    register=True,
-    mode="create",
-    dataset_index=0,
-    global_row_start=0,
-)
-manifest = m.materialize()
-print(f"Created {ds_id}: {manifest.cell_count} cells, {manifest.feature_count} features")
+index_doc = CorpusIndexDocument.from_yaml_file(corpus_root / "corpus-index.yaml")
+print([d.dataset_id for d in index_doc.datasets])
 ```
 
-```python
-# Step 4b — Append Xorion
-ds_id = "xorion_hct116_dual_guide"
-paths = resolve_corpus_paths("aggregate", corpus_root, ds_id)
-summary = load_summary(ds_id)
+The federated layout writes:
 
-# Read the current corpus index to learn global_row_start
-index_doc = yaml.safe_load((corpus_root / "corpus-index.yaml").read_text())
-first_entry = index_doc["datasets"][0]
-next_global_start = first_entry["global_end"]
-next_dataset_index = first_entry["dataset_index"] + 1
-
-m2 = DatasetMaterializer(
-    source_path="./demo_data/h5ad/demo_xorion_hct116_dual_guide.h5ad",
-    inspection_summary_path=str(inspect_summary_dir / ds_id / "dataset-summary.yaml"),
-    output_roots=OutputRoots(
-        metadata_root=str(paths.meta_root),
-        matrix_root=str(paths.matrix_root),
-    ),
-    dataset_id=ds_id,
-    backend="lance",
-    topology="aggregate",
-    corpus_index_path=str(corpus_root / "corpus-index.yaml"),
-    corpus_id="demo_corpus",
-    register=True,
-    mode="append",
-    dataset_index=next_dataset_index,
-    global_row_start=next_global_start,
-)
-manifest2 = m2.materialize()
-print(f"Appended {ds_id}: {manifest2.cell_count} cells, {manifest2.feature_count} features")
+```text
+artifacts/demo_corpus/
+├── corpus-index.yaml
+├── global-metadata.yaml
+├── marson_d2_rest/
+│   ├── matrix/marson_d2_rest.lance
+│   └── meta/
+│       ├── raw-obs.parquet
+│       ├── raw-var.parquet
+│       ├── size-factor.parquet
+│       └── hvg.parquet
+└── xorion_hct116_dual_guide/
+    ├── matrix/xorion_hct116_dual_guide.lance
+    └── meta/
+        ├── raw-obs.parquet
+        ├── raw-var.parquet
+        ├── size-factor.parquet
+        └── hvg.parquet
 ```
 
-??? tip "Using the CLI instead"
-    The CLI handles append bookkeeping (`dataset_index`, `global_row_start`)
-    automatically. For production use, the [Bash demo](bash_demo.md) CLI commands
-    are simpler. The Python API is shown here for notebook-style transparency.
+For the command-line equivalent, use the [Bash Demo](bash_demo.md).
 
 ---
 
-### Cell 5 — Install reviewed schemas
+## Install reviewed schemas
 
 Copy the reviewed demo final schemas into the corpus. These contain the
 biological decisions that turn raw metadata columns into canonical labels:
 
 ```python
-# Install schemas using the bundled helper
-import subprocess
-subprocess.run(
-    [sys.executable, "scripts/install_demo_schemas.py", "--corpus", str(corpus_root)],
-    check=True,
-)
+import shutil
+
+schema_root = repo_root / "examples" / "demo_canonicalization"
+for ds_id, _ in datasets:
+    source = schema_root / f"{ds_id}.final-schema.yaml"
+    target = corpus_root / ds_id / "meta" / "final-schema.yaml"
+    shutil.copyfile(source, target)
+    print(f"installed {ds_id} -> {target}")
 ```
 
 ```python
 # Verify they landed
 for ds_id in ["marson_d2_rest", "xorion_hct116_dual_guide"]:
-    schema_path = corpus_root / "meta" / ds_id / "final-schema.yaml"
+    schema_path = corpus_root / ds_id / "meta" / "final-schema.yaml"
     print(f"  {ds_id}: {'✓' if schema_path.exists() else '✗ missing'}")
 ```
 
 Read the quick decision sheets that explain what each schema does:
 
 ```python
+import yaml
 examples_root = Path("examples/demo_canonicalization")
 for ds_id in ["marson_d2_rest", "xorion_hct116_dual_guide"]:
     hints = yaml.safe_load((examples_root / f"{ds_id}.schema-hints.yaml").read_text())
@@ -224,43 +227,40 @@ For a deeper explanation, see [Canonicalization](demo_canonicalization.md).
 
 ---
 
-### Cell 6 — Canonicalize
+## Canonicalize
 
 Apply the reviewed schemas to produce canonical obs/var metadata:
 
 ```python
-# Dry-run first
-subprocess.run(
-    [sys.executable, "-m", "perturb_data_lab.cli", "canonicalize",
-     "--corpus", str(corpus_root), "--dry-run"],
-    check=True,
-)
-```
+from perturb_data_lab.canonical import run_canonicalization
+from perturb_data_lab.materializers.models import MaterializationManifest
 
-```python
-# Real canonicalization
-subprocess.run(
-    [sys.executable, "-m", "perturb_data_lab.cli", "canonicalize",
-     "--corpus", str(corpus_root)],
-    check=True,
-)
-print("Canonicalization complete.")
+index_doc = CorpusIndexDocument.from_yaml_file(corpus_root / "corpus-index.yaml")
+for ds in index_doc.datasets:
+    manifest = MaterializationManifest.from_yaml_file(corpus_root / ds.manifest_path)
+    paths = resolve_corpus_paths("federated", corpus_root, ds.dataset_id)
+
+    result = run_canonicalization(
+        dataset_id=ds.dataset_id,
+        raw_obs_path=corpus_root / manifest.raw_cell_meta_path,
+        raw_var_path=corpus_root / manifest.raw_feature_meta_path,
+        size_factor_path=corpus_root / manifest.size_factor_parquet_path,
+        schema_path=paths.meta_root / "final-schema.yaml",
+        output_root=paths.canonical_meta_root,
+    )
+    print(f"{result.dataset_id}: {result.obs_rows} obs rows, {result.var_rows} var rows")
 ```
 
 ---
 
-### Cell 7 — Validate and load the corpus
+## Validate and load the corpus
 
 ```python
-# Validate
-subprocess.run(
-    [sys.executable, "-m", "perturb_data_lab.cli", "corpus-validate",
-     str(corpus_root / "corpus-index.yaml")],
-    check=True,
-)
-
-# Load
+from perturb_data_lab.loaders.validation import validate_corpus_structure
 from perturb_data_lab.loaders import load_corpus
+
+report = validate_corpus_structure(corpus_root)
+print(report["status"], report["topology"], report["total_rows"])
 
 corpus = load_corpus(str(corpus_root))
 print(f"Datasets: {corpus.dataset_ids}")
@@ -270,7 +270,7 @@ print(f"Global vocab size: {corpus.feature_registry.global_vocab_size}")
 
 ---
 
-### Cell 8 — Inspect canonical metadata
+## Inspect canonical metadata
 
 Look at a few rows to confirm canonical labels are sensible:
 
@@ -297,7 +297,7 @@ print(xorion_rows)
 
 ```python
 # Quick stats
-meta = corpus.metadata_index
+meta = corpus.metadata_index.df
 all_perturb_labels = meta.get_column("perturb_label")
 
 # Count control vs treated
@@ -314,7 +314,7 @@ print(f"Sample conditions: {sorted(unique)[:10]}...")
 
 ---
 
-### Cell 9 — PertTF loader preview
+## PertTF loader preview
 
 Produce one paired batch to confirm the loader works end-to-end:
 
@@ -364,16 +364,17 @@ tgt_labels = corpus.take_metadata(
 )
 print("\nSource pairs:")
 for i in range(len(batch["index"])):
-    src = src_labels.row(i)
-    tgt = tgt_labels.row(i)
-    print(f"  {src[1]} {src[0]} -> {tgt[1]} {tgt[0]}")
+    print(
+        f"  {src_labels['dataset_id'][i]} {src_labels['perturb_label'][i]} "
+        f"-> {tgt_labels['dataset_id'][i]} {tgt_labels['perturb_label'][i]}"
+    )
 ```
 
 For more details on loader configuration, see [pertTF Loading](perttf_loader.md).
 
 ---
 
-### Cell 10 — AnnData handoff (Dask-backed)
+## AnnData handoff (Dask-backed)
 
 Export the combined corpus as a Dask-backed AnnData with inner-join on features:
 
@@ -417,7 +418,7 @@ For the full Scanpy/RAPIDS story, see [Scanpy & RAPIDS](scanpy_rapids.md).
 
 ## Re-running from scratch
 
-Delete the artifacts directory and re-run from Cell 1:
+Delete the artifacts directory and re-run from the download cell:
 
 ```python
 import shutil

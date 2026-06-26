@@ -28,9 +28,10 @@ or downstream analysis.
 
     ---
 
-    Run the notebook version with metadata inspection cells.
+    Run the notebook version, or view the rendered walkthrough with cell outputs.
 
     [:octicons-arrow-right-24: Jupyter materialization](jupyter_demo.md)
+    · [Rendered notebook](demo_walkthrough.ipynb)
 
 -   :material-tag:{ .lg .middle } __Canonicalization__
 
@@ -67,7 +68,7 @@ feed `PertTFPairedBatchLoader` and export Dask-backed AnnData for Scanpy.
 ```text
 HuggingFace download
   -> inspect
-  -> materialize (create + append)
+  -> materialize federated Lance corpus (both datasets at once)
   -> copy reviewed schemas
   -> canonicalize
   -> load_corpus()
@@ -76,7 +77,8 @@ HuggingFace download
 ```
 
 Start with [Installation](installation.md) and then follow the
-[Bash demo](bash_demo.md) or [Jupyter demo](jupyter_demo.md).
+[Bash demo](bash_demo.md), [Jupyter demo](jupyter_demo.md), or the
+[rendered notebook](demo_walkthrough.ipynb).
 
 ## Reference docs
 

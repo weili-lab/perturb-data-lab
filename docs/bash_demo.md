@@ -60,7 +60,7 @@ count source, and `materialization_readiness`. Materialization requires
 
 ## Step 2 — Create the corpus (first dataset)
 
-Create a new aggregate Lance corpus with the Marson dataset:
+Create a new federated Lance corpus with the Marson dataset:
 
 ```bash
 PYTHONPATH=src python -m perturb_data_lab.cli materialize \
@@ -70,15 +70,15 @@ PYTHONPATH=src python -m perturb_data_lab.cli materialize \
   --inspection-summary ./artifacts/review/marson_d2_rest/dataset-summary.yaml \
   --output-corpus ./artifacts/demo_corpus \
   --backend lance \
-  --topology aggregate
+  --topology federated
 ```
 
 This writes:
 
 - `artifacts/demo_corpus/corpus-index.yaml` — corpus registration
 - `artifacts/demo_corpus/global-metadata.yaml` — global metadata
-- `artifacts/demo_corpus/matrix/` — sparse Lance count tables
-- `artifacts/demo_corpus/meta/marson_d2_rest/` — raw obs/var, size factors, HVG
+- `artifacts/demo_corpus/marson_d2_rest/matrix/` — sparse Lance count table
+- `artifacts/demo_corpus/marson_d2_rest/meta/` — raw obs/var, size factors, HVG
 
 ## Step 3 — Append the second dataset
 
@@ -96,19 +96,32 @@ PYTHONPATH=src python -m perturb_data_lab.cli materialize \
 For append, the existing `corpus-index.yaml` supplies backend and topology — no
 need to repeat `--backend` or `--topology`.
 
-After this step the corpus index lists both datasets in order:
+## Step 3.5 — Materialize both datasets at once (alternative)
 
-```text
-datasets:
-  - dataset_id: marson_d2_rest
-    dataset_index: 0
-    global_start: 0
-    global_end: 2720
-  - dataset_id: xorion_hct116_dual_guide
-    dataset_index: 1
-    global_start: 2720
-    global_end: 5440
+Instead of running Step 2 and Step 3 separately, you can materialize both
+datasets in a single CLI call using an input-list CSV. First create the CSV:
+
+```bash
+cat > ./artifacts/demo_inputs.csv << 'EOF'
+source,dataset_id,inspection_summary
+./demo_data/h5ad/demo_marson_d2_rest.h5ad,marson_d2_rest,./artifacts/review/marson_d2_rest/dataset-summary.yaml
+./demo_data/h5ad/demo_xorion_hct116_dual_guide.h5ad,xorion_hct116_dual_guide,./artifacts/review/xorion_hct116_dual_guide/dataset-summary.yaml
+EOF
 ```
+
+Then materialize both in one call (the first row creates the corpus, the rest
+are appended automatically):
+
+```bash
+PYTHONPATH=src python -m perturb_data_lab.cli materialize \
+  --mode create \
+  --input-list ./artifacts/demo_inputs.csv \
+  --output-corpus ./artifacts/demo_corpus \
+  --backend lance \
+  --topology federated
+```
+
+This is the recommended one-call equivalent of Step 2 + Step 3.
 
 ## Step 4 — Install the reviewed demo schemas
 
@@ -151,8 +164,8 @@ This applies the reviewed final schemas to each dataset's raw metadata and
 writes canonical obs/var parquet files under:
 
 ```text
-artifacts/demo_corpus/meta/marson_d2_rest/canonical_meta/
-artifacts/demo_corpus/meta/xorion_hct116_dual_guide/canonical_meta/
+artifacts/demo_corpus/marson_d2_rest/meta/canonical_meta/
+artifacts/demo_corpus/xorion_hct116_dual_guide/meta/canonical_meta/
 ```
 
 Key canonical fields include `perturb_label`, `condition`, `perturb_type`,
@@ -203,7 +216,7 @@ All generated artifacts live under `./artifacts/`:
 | Path | Contents |
 |------|----------|
 | `artifacts/review/` | Inspection summaries |
-| `artifacts/demo_corpus/` | Materialized corpus (Lance sparse matrices, raw sidecars, canonical metadata) |
+| `artifacts/demo_corpus/` | Materialized federated corpus (per-dataset Lance matrices, raw sidecars, canonical metadata) |
 
 The raw demo `.h5ad` inputs under `./demo_data/` are never modified.
 
@@ -221,6 +234,7 @@ re-downloaded.
 ## Next steps
 
 - **[Jupyter Demo](jupyter_demo.md)** — the same workflow with interactive Python cells
+- **[Rendered Notebook](demo_walkthrough.ipynb)** — the executed walkthrough with cell outputs
 - **[Canonicalization](demo_canonicalization.md)** — understand the two demo schema decisions
 - **[pertTF Loading](perttf_loader.md)** — build paired batches from the corpus
 - **[Scanpy & RAPIDS](scanpy_rapids.md)** — export AnnData and run downstream analysis
