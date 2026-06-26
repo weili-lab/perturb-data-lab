@@ -48,7 +48,7 @@ or downstream analysis.
 
     [:octicons-arrow-right-24: pertTF loading](perttf_loader.md)
 
--   :material-chart-scatter:{ .lg .middle } __Scanpy & RAPIDS__
+-   :material-chart-scatter-plot:{ .lg .middle } __Scanpy & RAPIDS__
 
     ---
 
