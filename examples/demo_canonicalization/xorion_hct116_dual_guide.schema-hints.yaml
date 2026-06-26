@@ -1,0 +1,27 @@
+dataset_id: xorion_hct116_dual_guide
+final_schema: examples/demo_canonicalization/xorion_hct116_dual_guide.final-schema.yaml
+summary: Xorion uses sample-level batches and dual-guide labels.
+assumptions:
+  - The demo corpus appends Xorion second, so dataset_index stays 1.
+  - Control rows are only the all-non-targeting guide pairs.
+decisions:
+  - canonical_field: batch_id
+    source: obs.sample
+    rationale: sample already names the batch cleanly in the subset
+  - canonical_field: condition
+    source: obs.gene_target
+    transform: map Non-Targeting to ctrl
+    rationale: simple biological condition label for the demo
+  - canonical_field: perturb_label
+    source: obs.guide_target
+    transform: collapse non-targeting|non-targeting guide pairs to ctrl
+    rationale: keep treated guide-pair detail but simplify controls
+  - canonical_field: perturb_type
+    source: obs.gene_target
+    transform: Non-Targeting -> control, otherwise genetic
+    rationale: separates controls without over-claiming the exact mechanism
+  - canonical_field: gene_id
+    source: raw feature_id from var.index
+    rationale: preserves the native Xorion feature axis exactly as materialized
+caveats:
+  - feature_id mixes gene symbols and Ensembl-like IDs, so no harmonization is attempted here.

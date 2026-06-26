@@ -1,0 +1,27 @@
+dataset_id: marson_d2_rest
+final_schema: examples/demo_canonicalization/marson_d2_rest.final-schema.yaml
+summary: Marson uses lane-level batches and gene-level CRISPRi labels.
+assumptions:
+  - The demo corpus is created with Marson first, so dataset_index stays 0.
+  - The subset keeps only NTC-style controls, but the schema still accepts no sgRNA as ctrl.
+decisions:
+  - canonical_field: batch_id
+    source: obs.lane_id
+    rationale: lane is the cleanest batch unit in the demo subset
+  - canonical_field: condition
+    source: coalesce(obs.perturbed_gene_name, obs.guide_group)
+    transform: map NTC/no sgRNA to ctrl
+    rationale: treated rows stay gene-readable and controls collapse to one label
+  - canonical_field: perturb_label
+    source: obs.perturbed_gene_name
+    transform: normalize NTC* to ctrl
+    rationale: simple tutorial label for grouping and plotting
+  - canonical_field: perturb_type
+    source: obs.guide_type
+    transform: targeting -> crispri, non-targeting -> control
+    rationale: preserves the core biological distinction without extra detail
+  - canonical_field: gene_id
+    source: var.gene_name
+    rationale: reviewed Marson schema already uses gene symbols safely here
+caveats:
+  - Native feature axes are preserved; canonicalization changes metadata only.
