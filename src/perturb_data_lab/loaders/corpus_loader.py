@@ -95,21 +95,49 @@ class Corpus:
     def to_anndata(
         self,
         *,
-        dataset_id: str | Sequence[str],
+        dataset_id: str | Sequence[str] | None = None,
+        global_row_indices: Sequence[int] | np.ndarray | None = None,
         obs_columns: Sequence[str] | None = None,
         var_join: Literal["inner", "exact"] = "exact",
     ):
-        """Export whole selected dataset(s) as an in-memory AnnData object.
+        """Export selected corpus rows as an in-memory AnnData object.
 
-        By default ``var_join="exact"`` requires the selected datasets to share
-        the same ordered ``canonical_gene_id`` axis.  Use ``var_join="inner"``
-        to export the intersection of their gene features instead.
+        Pass ``global_row_indices`` to export rows in that exact order. Selected
+        rows must all belong to one dataset, whose var metadata and HVG rankings
+        are attached to the output. Without row indices, ``dataset_id`` retains
+        the whole-dataset export behavior. For multi-dataset exports,
+        ``var_join="exact"`` requires a shared ordered ``canonical_gene_id``
+        axis; ``var_join="inner"`` exports the feature intersection.
         """
         import anndata as ad
         from scipy import sparse
 
+        if global_row_indices is not None:
+            indices, selected = _resolve_single_dataset_global_indices(
+                self,
+                global_row_indices,
+                dataset_id=dataset_id,
+            )
+            var_df, n_vars, _mapping = _resolve_var_axis(self, selected, "exact")
+            var_df = _add_dataset_hvg_columns(self, var_df, selected[0])
+            obs = _build_obs_dataframe_for_indices(
+                self,
+                indices,
+                obs_columns=obs_columns,
+            )
+            batch = self.expression_reader.read_expression_flat(indices.tolist())
+            x = _expression_batch_to_csr(batch, n_vars=n_vars)
+            adata = ad.AnnData(X=x, obs=obs, var=_var_dataframe_to_pandas(var_df))
+            if not adata.obs_names.is_unique:
+                adata.obs_names_make_unique()
+            return adata
+
+        if dataset_id is None:
+            raise ValueError("dataset_id is required when global_row_indices is not provided")
         selected = _normalize_dataset_selection(dataset_id)
         var_df, n_vars, mapping = _resolve_var_axis(self, selected, var_join)
+        if len(selected) == 1:
+            var_df = _add_dataset_hvg_columns(self, var_df, selected[0])
         obs = _build_obs_dataframe(self, selected, obs_columns=obs_columns)
 
         if mapping is None and len(selected) == 1:
@@ -399,12 +427,68 @@ def _selected_dataset_global_indices(
     return np.concatenate(parts)
 
 
+def _resolve_single_dataset_global_indices(
+    corpus: Corpus,
+    global_row_indices: Sequence[int] | np.ndarray,
+    *,
+    dataset_id: str | Sequence[str] | None,
+) -> tuple[np.ndarray, tuple[str, ...]]:
+    indices = np.asarray(global_row_indices, dtype=np.int64)
+    if indices.ndim != 1:
+        raise ValueError("global_row_indices must be a 1-D sequence")
+    if indices.size == 0:
+        raise ValueError("global_row_indices must not be empty")
+    if np.any(indices < 0) or np.any(indices >= len(corpus.metadata_index)):
+        raise IndexError("global_row_indices contain out-of-range rows")
+
+    row_dataset_ids = corpus.take_metadata(indices, columns=("dataset_id",))["dataset_id"]
+    unique_dataset_ids = tuple(dict.fromkeys(str(value) for value in row_dataset_ids))
+    if len(unique_dataset_ids) != 1:
+        raise ValueError("global_row_indices must all belong to the same dataset")
+
+    inferred_dataset_id = unique_dataset_ids[0]
+    if dataset_id is not None:
+        requested = _normalize_dataset_selection(dataset_id)
+        if len(requested) != 1:
+            raise ValueError("dataset_id must identify one dataset when global_row_indices are provided")
+        if requested[0] != inferred_dataset_id:
+            raise ValueError(
+                f"global_row_indices belong to dataset {inferred_dataset_id!r}, "
+                f"not requested dataset {requested[0]!r}"
+            )
+    return indices, (inferred_dataset_id,)
+
+
 def _load_sorted_var_frame(corpus: Corpus, dataset_id: str) -> pl.DataFrame:
     var_df = pl.read_parquet(str(corpus.canonical_var_paths[dataset_id]))
     return var_df.with_columns(
         pl.col("origin_index").cast(pl.Int64, strict=True).alias("origin_index"),
         pl.col("canonical_gene_id").cast(pl.Utf8, strict=True).alias("canonical_gene_id"),
     ).sort("origin_index")
+
+
+def _add_dataset_hvg_columns(
+    corpus: Corpus,
+    var_df: pl.DataFrame,
+    dataset_id: str,
+) -> pl.DataFrame:
+    dataset_index = int(corpus.dataset_index_by_id[dataset_id])
+    local_to_global = corpus.feature_registry.local_to_global_map[
+        dataset_index,
+        : len(var_df),
+    ]
+    hvg_rank = corpus.feature_registry.hvg_rank_matrix[
+        dataset_index,
+        local_to_global,
+    ]
+    highly_variable = corpus.feature_registry.hvg_mask[
+        dataset_index,
+        local_to_global,
+    ]
+    return var_df.with_columns(
+        pl.Series("hvg_rank", hvg_rank.astype(np.int32, copy=False)),
+        pl.Series("highly_variable", highly_variable.astype(bool, copy=False)),
+    )
 
 
 def _resolve_var_axis(
@@ -495,6 +579,23 @@ def _build_obs_dataframe(
         frames.append(pd.DataFrame(corpus.take_metadata(indices, columns=columns)))
     obs = pd.concat(frames, ignore_index=True)
     obs.index = obs["global_row_index"].astype(str)
+    obs.index.name = None
+    return obs
+
+
+def _build_obs_dataframe_for_indices(
+    corpus: Corpus,
+    global_row_indices: np.ndarray,
+    *,
+    obs_columns: Sequence[str] | None,
+):
+    import pandas as pd
+
+    columns = _resolve_obs_columns(corpus, obs_columns)
+    obs = pd.DataFrame(corpus.take_metadata(global_row_indices, columns=columns))
+    obs.index = obs["global_row_index"].astype(str)
+    if not obs.index.is_unique:
+        obs.index = [f"{name}-{position}" for position, name in enumerate(obs.index)]
     obs.index.name = None
     return obs
 

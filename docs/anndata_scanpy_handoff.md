@@ -5,7 +5,7 @@ single-cell analysis tools.
 
 `perturb-data-lab` owns corpus materialization, canonical metadata, sparse count
 storage, feature alignment for loaders, durable per-dataset HVG rankings, and
-training/runtime access patterns. After whole selected dataset(s) are exported
+training/runtime access patterns. After selected corpus rows or datasets are exported
 as `AnnData`, Scanpy or RAPIDS should own the usual analysis preprocessing.
 
 ## Public handoff API
@@ -14,17 +14,18 @@ The handoff API has three parts:
 
 ```python
 adata = corpus.to_anndata(dataset_id="replogle_k562")
+adata = corpus.to_anndata(global_row_indices=[10, 25, 10])
 adata = corpus.to_anndata_lazy(dataset_id="replogle_k562", chunk_rows=4096)
 corpus.add_obs_meta(frame, on=["dataset_id", "cell_id"])
 ```
 
-- `to_anndata(...)` builds a normal in-memory AnnData with SciPy CSR `X`.
+- `to_anndata(...)` builds a normal in-memory AnnData with SciPy CSR `X` for whole datasets or selected global rows.
 - `to_anndata_lazy(...)` builds an AnnData whose `X` is a Dask array of sparse CSR chunks read from the corpus backend.
 - `add_obs_meta(...)` joins selected cell-level results back into the loaded corpus metadata at runtime.
 
-AnnData handoff is intentionally whole-dataset only. It does not accept
-`row_indices` or `local_row_indices`. Once data is in AnnData, subsetting should
-happen on the AnnData object.
+Selected-index export requires all global row indices to belong to one dataset.
+It preserves requested order and duplicate rows, and infers the dataset when
+`dataset_id` is omitted. Cross-dataset selected-index export fails explicitly.
 
 ## Feature-axis rule
 
@@ -46,7 +47,7 @@ chunk.
 
 ## Eager AnnData handoff
 
-Use `to_anndata(...)` when the selected whole dataset(s) fit in RAM:
+Use `to_anndata(...)` when the selected rows or whole dataset(s) fit in RAM:
 
 ```python
 from perturb_data_lab.loaders import load_corpus
@@ -61,6 +62,18 @@ adata = corpus.to_anndata(
     obs_columns=["perturb_label", "donor_id", "batch_id"],
 )
 ```
+
+For a selected row sequence from one dataset:
+
+```python
+adata = corpus.to_anndata(
+    global_row_indices=[105, 250, 105],
+    obs_columns=["perturb_label", "batch_id"],
+)
+```
+
+The output preserves `[105, 250, 105]`. Observation names are made unique when
+indices repeat, while `adata.obs["global_row_index"]` retains the exact values.
 
 For compatible datasets:
 
@@ -79,8 +92,10 @@ log-transformed layers.
 columns are present in the loaded metadata. Requested `obs_columns` are added
 alongside them.
 
-`adata.var` comes from the first selected dataset after the shared feature-axis
-check.
+For single-dataset and selected-index exports, `adata.var` contains the canonical
+var metadata plus `hvg_rank` and `highly_variable` from the corpus HVG ranking.
+For multi-dataset exports, `adata.var` comes from the first selected dataset after
+the shared feature-axis check.
 
 ## Lazy AnnData handoff
 
