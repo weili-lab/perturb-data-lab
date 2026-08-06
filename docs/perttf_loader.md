@@ -33,6 +33,8 @@ config = PertTFAdapterConfig(
     perturbation_label="perturbation",
     control_labels=("ctrl",),
     pairing_group_labels=("dataset", "celltype"),
+    normalize_expression="log1p",
+    normalization_scale=1.0,
 )
 
 loader = PertTFPairedBatchLoader(
@@ -134,6 +136,57 @@ The loader exposes useful effective pools after null-label filtering:
 loader.effective_label_row_indices
 loader.effective_source_indices
 loader.effective_target_candidate_indices
+loader.effective_pair_count
+```
+
+## Target-Driven Pairing
+
+Use target-driven pairing to visit every target cell once per epoch. Perturbed
+targets sample a matched control source with replacement, while control targets
+pair to the identical control cell:
+
+```python
+loader = PertTFPairedBatchLoader(
+    corpus,
+    batch_size=16,
+    seq_len=512,
+    config=config,
+    row_indices=train_rows,
+    source_indices=control_rows,
+    target_candidate_indices=np.concatenate([control_rows, perturbed_rows]),
+    pairing_mode="target_driven",
+    drop_last=False,
+)
+```
+
+Target-driven pairing requires control-only sources. Every control target must
+also be in the source pool so it can self-pair. Pairing groups configured by
+`pairing_group_labels` constrain each control sampled for a perturbed target to
+the target's group. Epoch length is determined by the number of target rows;
+with `drop_last=True`, the final incomplete batch is omitted. Source-driven
+pairing remains the default.
+
+## Perturbed Source Policy
+
+`perturbed_target_policy` controls how a source row that is already perturbed is
+paired:
+
+- `"self_to_control_label"` (default): reuse the source expression as the target and emit the control label
+- `"self_to_self_label"`: reuse the source expression as the target and emit its own perturbation label
+- `"matched_control_cell"`: pair to a control row from the same configured pairing group
+
+With `"self_to_self_label"`, a control source still pairs to a treated target when one exists in its pairing group. If none exists, the control pairs to itself with the control label.
+
+For an idempotent perturbation target, use:
+
+```python
+loader = PertTFPairedBatchLoader(
+    corpus,
+    batch_size=16,
+    seq_len=512,
+    config=config,
+    perturbed_target_policy="self_to_self_label",
+)
 ```
 
 ## Null Labels
@@ -169,7 +222,8 @@ Major output keys:
 - `values`: masked source expression values
 - `target_values`: unmasked source values
 - `target_values_next`: paired target values aligned to sampled source genes
-- `sf`, `sf_next`: source and target size factors
+- with `normalize_expression="log1p"`, expression values are `log1p(count / size_factor * normalization_scale)`
+- `sf`, `sf_next`: `normalization_scale / size_factor`, matching pertTF's normalization-multiplier convention
 - `index`, `next_index`: source and target global row indices
 - `{label}_labels`, `{label}_labels_next`: integer label IDs for configured labels
 

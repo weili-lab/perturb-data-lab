@@ -301,11 +301,11 @@ def test_paired_batch_builder_reconstructs_target_values_at_source_sampled_genes
     assert batch["sf_next"].shape == (2, 1)
     torch.testing.assert_close(
         batch["sf"],
-        torch.tensor([[1.0], [1.2]], dtype=torch.float32),
+        torch.tensor([[1.0], [1.0 / 1.2]], dtype=torch.float32),
     )
     torch.testing.assert_close(
         batch["sf_next"],
-        torch.tensor([[1.2], [1.2]], dtype=torch.float32),
+        torch.tensor([[1.0 / 1.2], [1.0 / 1.2]], dtype=torch.float32),
     )
     assert batch["perturbation_labels_next"].tolist() == [1, 0]
     assert batch["batch_labels_next"].tolist() == [1, 1]
@@ -332,6 +332,37 @@ def test_paired_batch_builder_reconstructs_target_values_at_source_sampled_genes
             global_id = token_id - offset
             assert batch["target_values"][batch_row, col].item() == source_dense[global_id]
             assert batch["target_values_next"][batch_row, col].item() == target_dense[global_id]
+
+
+def test_paired_batch_builder_lognorm_uses_scaled_reciprocal_size_factor(
+    tmp_path: Path,
+) -> None:
+    config = PertTFAdapterConfig(
+        control_labels=("WT",),
+        mask_ratio=0.0,
+        normalize_expression="log1p",
+        normalization_scale=1.5,
+    )
+    corpus = load_corpus(str(_build_small_pair_corpus(tmp_path)))
+    pair_batch = _build_pair_sampler(
+        corpus,
+        batch_size=1,
+        config=config,
+        seed=7,
+        drop_last=False,
+    ).pair_source_positions([1], seed=11)
+    builder = PertTFPairedBatchBuilder(corpus, seq_len=4, config=config)
+
+    batch = builder.build_paired_batch(
+        pair_batch,
+        sampled_gene_ids=torch.arange(4).unsqueeze(0),
+    )
+
+    expected = torch.log1p(torch.tensor(_dense_row(1)) / 1.2 * 1.5)
+    torch.testing.assert_close(batch["target_values"][0, 1:], expected)
+    torch.testing.assert_close(batch["target_values_next"][0, 1:], expected)
+    torch.testing.assert_close(batch["sf"], torch.tensor([[1.5 / 1.2]]))
+    torch.testing.assert_close(batch["sf_next"], torch.tensor([[1.5 / 1.2]]))
 
 
 def test_paired_batch_builder_emits_extra_configured_label_tensors(
@@ -759,6 +790,7 @@ def _build_public_pair_loader(
     multiprocessing_context: str | None,
     drop_last: bool = True,
     perturbed_target_policy: str = "self_to_control_label",
+    pairing_mode: str = "source_driven",
     config: PertTFAdapterConfig | None = None,
     adapter: PertTFCorpusAdapter | None = None,
     row_indices=None,
@@ -776,6 +808,7 @@ def _build_public_pair_loader(
         seed=seed,
         drop_last=drop_last,
         perturbed_target_policy=perturbed_target_policy,
+        pairing_mode=pairing_mode,
         source_indices=source_indices,
         target_candidate_indices=target_candidate_indices,
         sampling_mode="hvg",
@@ -1098,6 +1131,52 @@ def test_paired_batch_builder_requires_size_factor_metadata(tmp_path: Path) -> N
         builder.build_paired_batch(pair_batch, seed=5)
 
 
+def test_public_paired_batch_loader_supports_self_to_self_labels(tmp_path: Path) -> None:
+    corpus = load_corpus(str(_build_small_pair_corpus(tmp_path)))
+    loader = _build_public_pair_loader(
+        corpus,
+        batch_size=1,
+        seq_len=3,
+        seed=7,
+        num_workers=0,
+        multiprocessing_context=None,
+        drop_last=False,
+        perturbed_target_policy="self_to_self_label",
+        source_indices=np.asarray([1], dtype=np.int64),
+    )
+
+    batch = next(iter(loader))
+
+    assert batch["index"].tolist() == [1]
+    assert batch["next_index"].tolist() == [1]
+    assert batch["perturbation_labels"].tolist() == [1]
+    assert batch["perturbation_labels_next"].tolist() == [1]
+    torch.testing.assert_close(batch["target_values"], batch["target_values_next"])
+
+
+def test_public_paired_batch_loader_self_pairs_control_without_treated_pool(tmp_path: Path) -> None:
+    corpus = load_corpus(str(_build_small_pair_corpus(tmp_path)))
+    loader = _build_public_pair_loader(
+        corpus,
+        batch_size=1,
+        seq_len=3,
+        seed=7,
+        num_workers=0,
+        multiprocessing_context=None,
+        drop_last=False,
+        perturbed_target_policy="self_to_self_label",
+        row_indices=np.asarray([0], dtype=np.int64),
+    )
+
+    batch = next(iter(loader))
+
+    assert batch["index"].tolist() == [0]
+    assert batch["next_index"].tolist() == [0]
+    assert batch["perturbation_labels"].tolist() == [0]
+    assert batch["perturbation_labels_next"].tolist() == [0]
+    torch.testing.assert_close(batch["target_values"], batch["target_values_next"])
+
+
 def test_public_paired_batch_loader_explicit_pools_intersect_row_indices(
     tmp_path: Path,
 ) -> None:
@@ -1124,6 +1203,30 @@ def test_public_paired_batch_loader_explicit_pools_intersect_row_indices(
     assert loader.effective_label_row_indices.tolist() == [0, 1]
     assert loader.effective_source_indices.tolist() == [1]
     assert loader.effective_target_candidate_indices.tolist() == [0]
+
+
+def test_public_paired_batch_loader_supports_target_driven_pairing(tmp_path: Path) -> None:
+    corpus = load_corpus(str(_build_three_row_pair_corpus(tmp_path)))
+    loader = _build_public_pair_loader(
+        corpus,
+        batch_size=2,
+        seq_len=3,
+        seed=7,
+        num_workers=0,
+        multiprocessing_context=None,
+        drop_last=False,
+        pairing_mode="target_driven",
+        source_indices=np.asarray([0], dtype=np.int64),
+        target_candidate_indices=np.asarray([1, 2], dtype=np.int64),
+    )
+
+    batch = next(iter(loader))
+
+    assert loader.effective_pair_count == 2
+    assert batch["index"].tolist() == [0, 0]
+    assert sorted(batch["next_index"].tolist()) == [1, 2]
+    assert batch["perturbation_labels"].tolist() == [0, 0]
+    assert sorted(batch["perturbation_labels_next"].tolist()) == [1, 2]
 
 
 def test_pair_read_dataloader_supports_spawn_workers(tmp_path: Path) -> None:

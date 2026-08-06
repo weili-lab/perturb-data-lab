@@ -96,6 +96,7 @@ def _build_sampler(
     seed: int = 0,
     drop_last: bool = True,
     perturbed_target_policy: str = "self_to_control_label",
+    pairing_mode: str = "source_driven",
 ) -> PerturbationPairSampler:
     prepared = _prepare_perttf_metadata(
         metadata_index,
@@ -116,6 +117,7 @@ def _build_sampler(
         seed=seed,
         drop_last=drop_last,
         perturbed_target_policy=perturbed_target_policy,
+        pairing_mode=pairing_mode,
     )
 
 
@@ -183,6 +185,37 @@ def test_perturbed_sources_default_to_self_with_control_label_override() -> None
     np.testing.assert_array_equal(batch.target_perturbation_ids, np.asarray([0, 0], dtype=np.int64))
 
 
+def test_perturbed_sources_can_pair_to_self_with_source_label() -> None:
+    sampler = _build_sampler(
+        _build_metadata_index(),
+        batch_size=4,
+        config=_default_config(),
+        perturbed_target_policy="self_to_self_label",
+        seed=3,
+    )
+
+    batch = sampler.pair_source_positions([1, 2, 4])
+
+    np.testing.assert_array_equal(batch.target_indices, np.asarray([1, 2, 4], dtype=np.int64))
+    np.testing.assert_array_equal(batch.target_perturbation_ids, np.asarray([1, 2, 3], dtype=np.int64))
+
+
+def test_control_source_without_treated_pool_can_pair_to_self() -> None:
+    sampler = _build_sampler(
+        _build_metadata_index(),
+        batch_size=1,
+        config=_dataset_group_config("dataset", "celltype"),
+        row_indices=[3],
+        perturbed_target_policy="self_to_self_label",
+        drop_last=False,
+    )
+
+    batch = sampler.pair_source_positions([0])
+
+    np.testing.assert_array_equal(batch.target_indices, np.asarray([3], dtype=np.int64))
+    np.testing.assert_array_equal(batch.target_perturbation_ids, np.asarray([0], dtype=np.int64))
+
+
 def test_matched_control_policy_respects_explicit_pairing_groups() -> None:
     sampler = _build_sampler(
         _build_metadata_index(),
@@ -196,6 +229,89 @@ def test_matched_control_policy_respects_explicit_pairing_groups() -> None:
 
     np.testing.assert_array_equal(batch.target_indices, np.asarray([0, 0, 5], dtype=np.int64))
     np.testing.assert_array_equal(batch.target_perturbation_ids, np.asarray([0, 0, 0], dtype=np.int64))
+
+
+def test_target_driven_pairing_visits_each_target_with_matched_control() -> None:
+    sampler = _build_sampler(
+        _build_metadata_index(),
+        batch_size=2,
+        config=_dataset_group_config("dataset", "celltype"),
+        source_indices=[0, 3, 5],
+        target_candidate_indices=[1, 2, 4, 6],
+        pairing_mode="target_driven",
+        seed=13,
+        drop_last=False,
+    )
+
+    batches = list(sampler)
+    source_by_target = {
+        int(target): int(source)
+        for batch in batches
+        for source, target in zip(batch.source_indices, batch.target_indices, strict=True)
+    }
+
+    assert len(sampler) == 2
+    assert sampler.effective_pair_count == 4
+    assert source_by_target == {1: 0, 2: 0, 4: 3, 6: 5}
+    assert sorted(source_by_target) == [1, 2, 4, 6]
+
+
+def test_target_driven_pairing_self_pairs_control_targets() -> None:
+    sampler = _build_sampler(
+        _build_metadata_index(),
+        batch_size=3,
+        config=_dataset_group_config("dataset", "celltype"),
+        source_indices=[0, 3, 5],
+        target_candidate_indices=[0, 1, 3, 4, 5, 6],
+        pairing_mode="target_driven",
+        seed=13,
+        drop_last=False,
+    )
+
+    batches = list(sampler)
+    pairs = {
+        int(target): (int(source), int(label))
+        for batch in batches
+        for source, target, label in zip(
+            batch.source_indices,
+            batch.target_indices,
+            batch.target_perturbation_ids,
+            strict=True,
+        )
+    }
+
+    assert sampler.effective_pair_count == 6
+    assert pairs[0] == (0, 0)
+    assert pairs[3] == (3, 0)
+    assert pairs[5] == (5, 0)
+    assert pairs[1][0] == 0
+    assert pairs[4][0] == 3
+    assert pairs[6][0] == 5
+
+
+@pytest.mark.parametrize(
+    ("source_indices", "target_candidate_indices", "message"),
+    [
+        ([0, 1], [2], "control-only source_positions"),
+        ([3], [0, 4], "control targets to be present in source_positions"),
+        ([0], [7], "no matched control source"),
+    ],
+)
+def test_target_driven_pairing_rejects_invalid_pools(
+    source_indices,
+    target_candidate_indices,
+    message,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        _build_sampler(
+            _build_metadata_index(),
+            batch_size=2,
+            config=_dataset_group_config("dataset", "celltype"),
+            source_indices=source_indices,
+            target_candidate_indices=target_candidate_indices,
+            pairing_mode="target_driven",
+            drop_last=False,
+        )
 
 
 def test_missing_target_pool_raises_explicit_error() -> None:
